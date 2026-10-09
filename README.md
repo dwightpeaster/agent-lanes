@@ -28,7 +28,7 @@ Restart Codex after installation.
 /reload-plugins
 ```
 
-Requirements: Python 3.10+, git, and at least one of the `claude` or `codex` CLIs, signed in.
+Requirements: macOS or Linux (POSIX locks/process groups), Python 3.10+, git, and at least one of the `claude` or `codex` CLIs, signed in.
 
 ## Use
 
@@ -74,6 +74,10 @@ lanectl launch-group --warm-cache               optionally stagger compatible la
 lanectl risk                                    advisory risk, review requirement and effort
 lanectl review prepare | findings              gate exact-commit packets and validate reviewer evidence
 lanectl wait | status | report | questions      batched changes, compact status, final report, open questions
+lanectl setup                                   prepare dependencies using shared download caches
+lanectl brief | approve-brief                   generate and approve a normalized ticket brief
+lanectl integration | ci                        combined commit checks and compact exact-commit CI
+lanectl summary | compare                       actual totals and paired completed-run comparison
 lanectl check                                   run a lane's validation; print only pass/fail and failing lines
 lanectl scope                                   detect out-of-ownership changes and cross-lane overlaps
 lanectl queue | merged | sync                   merge queue, record a merge, rebase idle lanes
@@ -81,6 +85,30 @@ lanectl usage                                   tokens (fresh, cache write, cach
 lanectl note | packet                           ledger entries and the resume packet
 lanectl cleanup                                 safe worktree and branch removal
 ```
+
+### Prepare real application lanes
+
+Configure `setup` before adding worktrees, for example `pnpm install --frozen-lockfile --store-dir "$LANE_PACKAGE_CACHE/pnpm"`. Each implementation lane runs setup once per lockfile, configured commands, environment templates and tool-version fingerprint. A failure blocks launch and requires an explicit `lanectl setup` retry. Repositories with lockfiles must configure setup or declare `setup_not_required=yes`. Installed dependencies stay in each worktree; only package downloads are shared. npm, pip and uv get shared cache defaults unless already configured.
+
+Every lane receives a unique `LANE_NAMESPACE`, `LANE_DB_SUFFIX`, 16-port range, and temporary directory. Setup, agents and checks receive the same environment. Configure `lane_env` as a JSON object, or supply `run new --env-template-file env-templates.json`:
+
+```json
+{"PORT":"{port_start}","TEST_DB_NAME":"test_{namespace}","DATABASE_URL":"${TEST_DATABASE_PREFIX}{db_suffix}"}
+```
+
+Inherited values such as `TEST_DATABASE_PREFIX` are substituted at execution time and are not saved. Use test-only credentials and endpoints per repository rules. Applications must actually consume these variables for isolation to work. Reservations coordinate Agent Lanes sharing one home directory; other processes can occupy ports after probing. `LANE_PORT_PROBED=0` means sandbox restrictions prevented probing.
+
+Implementation launches require an isolated worktree, a Goal, acceptance criteria, validation and current setup. An explicit `--no-validation-required '<user directive>'` can waive a lane check. To cut coordinator reading, `brief --ticket-file ticket.json` accepts normalized `title`, `acceptance`, `validation` and dependency item IDs; optional profile `ticket_command` is a JSON argument array with `{id}` placeholders. It proposes start files from `map` and maps known dependencies. Assign ownership, inspect the draft and run `approve-brief` before launch. Missing requirements are rejected rather than invented.
+
+New runs require `integration` before the queue marks a lane next. It merges exact queued commits in dependency/resource order into a disposable checkout and runs the full run gate. Source lanes remain unchanged. Any changed commit, base, gate, environment or order invalidates the proof; fetch/sync the base before preparing it and recompute after each merge. `--integration optional` explicitly opts out. `sync --check` validates branches even when already up to date and returns failure for a failed check.
+
+Optional `check --baseline-command '<focused test command>'` first requires that command to pass on the candidate, then applies changed test files to the base in an isolated checkout. Base failure is supporting regression evidence, not proof of complete coverage; imports, syntax errors and missing commands are inconclusive. Configure `secret_scan` in the profile to run a scanner as an additional gate. Its output is redacted; a missing or failing scanner blocks the check. There is no claim that simple patterns can find every secret.
+
+`lane add --token-budget N` is a soft reported-token limit: CLI events can arrive after substantial work, so it cannot cap in-flight spending. A budget stop is recorded as blocked and never silently retried. Claude also supports its native `--budget-usd`.
+
+`summary` reports elapsed time separately from summed agent time; closing a run saves `summary.json`. `compare` accepts two closed runs with the same starting commit and tasks, a single-session serial baseline, and explicit matching-criteria/fixtures/passing-result evidence. It compares reported agent counts, including cache writes. Coordinator calls outside lanectl remain unmeasured. Repeat controlled trials before claiming whole-workflow savings. Automatic model learning, cache-expiry resets, transient retries and push notifications remain deferred pending evidence and explicit policies.
+
+Claude lane defaults and this repository's `.claude/settings.json` disable commit/PR attribution. Lanes are instructed to omit agent credits and co-author trailers. This does not rewrite Git history.
 
 ### Adjusting CLI flags
 
@@ -153,7 +181,7 @@ When the user asks to update Agent Lanes:
 4. Open runs keep working. Lanes started before the update keep their original session, contract and system prompt. New lanes get the new defaults.
 5. If `~/.agent-lanes/adapters.json` overrides a Claude launch command, the override still wins. Compare it with the defaults (`lanectl launch --dry-run`) and tell the user which new flags it lacks. Don't change it without asking.
 
-New runs snapshot shared contracts. Existing runs acquire a snapshot on their next command, while already-started sessions retain their earlier context. Old review lanes without `--review-of` must be replaced with exact-commit reviewers. Reviewer overrides are intentionally ignored; implementer overrides remain supported and freeze on first use. No global Codex configuration is changed.
+New runs snapshot shared contracts. Existing runs acquire a snapshot on their next command, while already-started sessions retain their earlier context. Existing implementation lanes need `lanectl setup` before further turns; old runs retain their integration opt-out until explicitly enabled. Old review lanes without `--review-of` must be replaced with exact-commit reviewers. Reviewer overrides are intentionally ignored; implementer overrides remain supported and freeze on first use. No global Codex configuration is changed.
 
 ### Upgrading to 0.2.0
 

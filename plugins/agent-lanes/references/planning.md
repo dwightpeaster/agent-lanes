@@ -48,3 +48,9 @@ Claude lanes load only file, search and shell tools, with no MCP servers or skil
 Write each brief from `references/protocol.md`. The lane contract is added automatically. Write only the task-specific part.
 
 Tell the user the plan in a compact table before launching: lane, items, tool/model/effort, why, and what's queued behind what. In `review` mode, launch after the user agrees. If they already said to go ahead, launch right away.
+
+Initial implementation launches require Goal, acceptance criteria, validation and current setup. Missing requirements block launch. `--no-validation-required` records an explicit user waiver. Setup must also be current on resume.
+
+For normalized ticket JSON, use `brief --ticket-file <file>` (title, acceptance list, validation list, dependency item IDs), or configure a JSON argv `ticket_command` and use `--ticket-id`. Unknown dependencies fail. Map results propose start files, never ownership. Inspect/edit the draft, assign `--owns`, then `approve-brief`. Edits after approval require reapproval. Explicit validation commands remain in lane settings.
+
+Reserve test databases/ports using lane_env templates and assigned LANE_* variables. `--token-budget N` is a soft reported-token guard, not a per-request spending cap. No automatic resets or retries.

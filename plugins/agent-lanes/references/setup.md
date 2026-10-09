@@ -1,10 +1,10 @@
 # Session Setup
 
-Run at the start of every new run. Keep it short; the goal is a correct profile, not a survey.
+Run at the start of every new run. Keep it short.
 
 ## 1. Check the tools and the saved profile
 
-`lanectl doctor`. Note which CLIs exist. If only one of Claude Code or Codex is installed, every lane uses that one.
+`lanectl doctor`. Use installed CLIs.
 
 `lanectl profile show --repo .`. The repository's profile lives in a managed block in its `AGENTS.md`. If it has no missing fields, skip to step 4 and ask only for the run's scope. Otherwise do steps 2 and 3 for the missing fields only.
 
@@ -24,6 +24,11 @@ Mark each field **repo** (found) or **ask** (missing). Profile keys are in brack
 | Base branch [base] | Where lanes branch from and PRs target |
 | Branch naming [branch] | Pattern for lane branches |
 | Worktree location [worktrees] | Where lane worktrees go. Default suggestion: `auto` (inside the run folder, outside the repo) |
+| Dependency setup [setup] | Frozen-lock install command; shared downloads only. Lockfiles require setup or setup_not_required=yes |
+| Test isolation [lane_env] | JSON environment templates consuming namespace/ports/db suffix; inherited secrets via ${VAR} |
+| Ticket adapter [ticket_command] | Optional JSON argv returning normalized title, acceptance, validation and dependencies |
+| Combined gate [integration] | Required by default for new runs; optional only when repo/user policy allows |
+| Secret scanner [secret_scan] | Optional installed scanner command; failure blocks, output redacted |
 | Validation [validate] | The PR gate and per-lane test commands |
 | Smoke tests [smoke] | Required or not, the command, what "green" means |
 | PR flow [pr] | Draft first? Labels? Required reviewers? |
@@ -55,4 +60,6 @@ lanectl run new --repo . --name "<short name>"
 
 `run new` takes base, mode, validation and protected rules from the profile. Override with `--base`, `--mode`, or `lanectl run set --run <dir> --validate "<cmd>; <cmd>" --protected "<rule>; <rule>"`.
 
-Log the user's answers that change behavior with `lanectl note --kind directive`. Then confirm the profile to the user in five lines or fewer and move to planning.
+Log the user's answers that change behavior with `lanectl note --kind directive`. Then confirm the profile briefly and move to planning.
+
+Worktree creation runs setup. Failures block launch; resolve the cause then explicitly run `lanectl setup`. Setup, agent and check share assigned LANE_* variables. Configure applications to consume them. Package downloads may share LANE_PACKAGE_CACHE; installed environments remain separate.

@@ -1,7 +1,13 @@
 # Changelog
 
-### Additional v0.2.0 draft changes
+### Additional v0.2.0 changes
 
+- Fix `sync --check` skipping validation for already-current branches; propagate check failures through sync/merged exit codes.
+- Add fingerprinted dependency setup, shared download caches, cross-run test namespaces/port leases, runtime environment templates and launch readiness checks.
+- Generate normalized ticket briefs with mapped start files/dependencies and explicit coordinator approval after assigning ownership.
+- Require disposable combined-result validation for new runs; bind proofs to exact commits, gates, environments and dependency/resource order. Add opt-in candidate/base regression evidence and redacted configured secret scanners.
+- Add compact exact-commit CI, run summaries and paired completed-run comparisons including reported cache writes. Keep unreported coordinator cost and dollar savings unknown.
+- Add soft reported-token limits with explicit blocked state; document macOS/Linux support. Disable Claude attribution in lane defaults and repository settings; omit agent co-author trailers.
 - Freeze role contracts per run and adapter overrides on first use; canonicalize Claude extra tools. Use supported dynamic-system-context exclusion and explicit system-prompt snapshots.
 - Add configuration fingerprints, deduplicated first-call Claude cache samples, and unknown values for unreported Codex cache-write counts and cost.
 - Add optional `launch-group --warm-cache`, preserving unstarted followers after timeout/failure. Add an opt-in Codex developer-instruction boundary experiment and a reproducible live CLI benchmark, requiring external-call authorization.

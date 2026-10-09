@@ -9,7 +9,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    raise SystemExit("Agent Lanes currently supports POSIX systems (tested on macOS and Linux), not Windows")
 import fnmatch
 import hashlib
 import json
@@ -25,6 +28,9 @@ from pathlib import Path
 
 import lane_cache
 import lane_review
+import lane_runtime
+import lane_planning
+import lane_integration
 
 VERSION = "0.2.0"
 SCRIPT = Path(__file__).resolve()
@@ -52,6 +58,7 @@ MANAGED_END = "<!-- agent-lanes:end -->"
 PROFILE_KEYS = (
     "work_source", "base", "branch", "worktrees", "validate", "smoke", "pr", "merge", "review",
     "tracker", "protected", "resources", "deploy", "cleanup", "mode", "risk_patterns",
+    "setup", "setup_not_required", "lane_env", "ticket_command", "integration", "secret_scan",
 )
 FAILURE_LINE = re.compile(r"error|fail|assert|exception|traceback|expected|panic|not ok|\bE\s", re.IGNORECASE)
 DEFINITION = re.compile(r"^\s*(export\s+)?(default\s+)?(async\s+)?(def|class|function|interface|type|struct|"
@@ -76,12 +83,14 @@ DEFAULT_ADAPTERS = {
                 "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits",
                 "--name", "{name}", "--append-system-prompt", "{contract}", "--tools", "{tools}",
                 "--strict-mcp-config", "--mcp-config", "{mcp_config}", "--disable-slash-commands",
+                "--settings", '{"attribution":{"commit":"","pr":"","sessionUrl":false}}',
                 "{allow_args}", "{deny_args}", "{budget_args}"],
         "resume": ["claude", "-p", "{prompt}", "--resume", "{session}", "--model", "{model}",
                    "--effort", "{effort}", "--output-format", "stream-json", "--verbose",
                    "--permission-mode", "acceptEdits", "--append-system-prompt", "{contract}",
                    "--tools", "{tools}", "--strict-mcp-config",
                    "--mcp-config", "{mcp_config}", "--disable-slash-commands",
+                   "--settings", '{"attribution":{"commit":"","pr":"","sessionUrl":false}}',
                    "{allow_args}", "{deny_args}", "{budget_args}"],
     },
     "codex": {
@@ -141,10 +150,33 @@ def csv(value: str | None) -> list[str]:
 
 
 def split_commands(value: str | None) -> list[str]:
-    """Split validation commands on ';' or newlines, or on commas when neither is present (0.1 form)."""
-    if not value or not re.search(r"[;\n]", value):
-        return csv(value)
-    return [item.strip() for item in re.split(r"[;\n]", value) if item.strip()]
+    """Split separators outside shell quotes, preserving command text and legacy commas."""
+    if not value:
+        return []
+    positions = []; quote = None; escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False; continue
+        if char == "\\" and quote != "'":
+            escaped = True; continue
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char in ";\n,":
+            positions.append((index, char))
+    if quote:
+        raise LaneError("command list has an unterminated shell quote")
+    primary = any(char in ";\n" for _, char in positions)
+    cuts = [index for index, char in positions if char in ";\n" or not primary]
+    result = []; start = 0
+    for end in cuts + [len(value)]:
+        part = value[start:end].strip()
+        if part:
+            result.append(part)
+        start = end + 1
+    return result
 
 
 def effort_rank(level: str) -> int:
@@ -327,6 +359,9 @@ def refresh(run: Run, data: dict, lane: dict) -> dict:
             lane["exit_code"] = code
             lane["state"] = "turn-ended" if code == 0 and not info["error"] else "failed"
             lane["error"] = info["error"]
+            guard = ldir / f"attempt-{attempt}.guard"
+            if guard.exists():
+                lane.update({"state": "blocked", "error": guard.read_text(), "report_status": "blocked"})
             if lane["kind"] == "review":
                 try:
                     lane_review.verify_checkout(sys.modules[__name__], lane)
@@ -371,9 +406,12 @@ def cmd_run_new(args) -> None:
     path = home() / repo_key(root) / run_id
     if path.exists():
         raise LaneError(f"run already exists: {path}")
-    (path / "lanes").mkdir(parents=True)
     data = {
-        "schema": 1, "id": run_id, "name": args.name, "repo": str(root), "base": args.base,
+        "schema": 2, "id": run_id, "name": args.name, "repo": str(root), "base": args.base,
+        "initial_base_sha": git("rev-parse", args.base, cwd=root),
+        "environment_templates": json.loads(Path(args.env_template_file).read_text()) if args.env_template_file
+                                 else json.loads(profile.get("lane_env", "{}")),
+        "integration_required": (args.integration or profile.get("integration", "required")) == "required",
         "mode": args.mode, "effort_ceiling": DEFAULT_CEILING, "state": "open",
         "created": now(), "updated": now(), "contracts": lane_cache.snapshot_contracts(PLUGIN_ROOT),
         "profile": profile, "codex_contract": args.codex_contract,
@@ -381,9 +419,15 @@ def cmd_run_new(args) -> None:
                                   if args.codex_developer_prefix_file else "",
         "rules": {"validate": split_commands(profile.get("validate")),
                   "protected": split_commands(profile.get("protected")), "notes": [],
-                  "risk_patterns": csv(profile.get("risk_patterns"))},
+                  "risk_patterns": csv(profile.get("risk_patterns")),
+                  "setup": split_commands(args.setup if args.setup is not None else profile.get("setup")),
+                  "setup_not_required": args.setup_not_required or profile.get("setup_not_required") == "yes",
+                  "secret_scan": profile.get("secret_scan")},
         "lanes": {},
     }
+    if not isinstance(data["environment_templates"], dict):
+        raise LaneError("lane_env must be a JSON object of environment templates")
+    (path / "lanes").mkdir(parents=True)
     atomic_write(path / "run.json", json.dumps(data, indent=2, sort_keys=True) + "\n")
     atomic_write(path / "ledger.md", (
         f"# Ledger: {args.name}\n\nRepo: {root}\nBase: {args.base}\nMode: {args.mode}\n"
@@ -411,6 +455,9 @@ def cmd_run_list(args) -> None:
 def cmd_run_set(args) -> None:
     run = resolve_run(args.run)
     with run.locked() as data:
+        if any(lane["state"] == "running" for lane in data["lanes"].values()) and any(
+                getattr(args, name) is not None for name in ("setup", "env_template_file", "validate", "protected", "base")):
+            raise LaneError("do not change run gates/environment while lanes are running")
         if args.mode:
             data["mode"] = args.mode
         if args.base:
@@ -422,7 +469,23 @@ def cmd_run_set(args) -> None:
         if args.risk_patterns is not None:
             data["rules"]["risk_patterns"] = csv(args.risk_patterns)
         if args.state:
+            if args.state == "closed" and any(lane["state"] not in ("merged", "closed") for lane in data["lanes"].values()):
+                raise LaneError("close every lane before closing the run")
             data["state"] = args.state
+            if args.state == "closed":
+                data["closed_at"] = now()
+                atomic_write(run.path / "summary.json", json.dumps(lane_planning.summary(sys.modules[__name__], data), indent=2) + "\n")
+        if args.setup is not None:
+            data["rules"]["setup"] = split_commands(args.setup)
+        if args.setup_not_required:
+            data["rules"]["setup_not_required"] = True
+        if args.env_template_file:
+            templates = json.loads(Path(args.env_template_file).read_text())
+            if not isinstance(templates, dict):
+                raise LaneError("environment templates must be a JSON object")
+            data["environment_templates"] = templates
+        if args.integration:
+            data["integration_required"] = args.integration == "required"
     if args.mode:
         run.note("directive", f"autonomy mode set to {args.mode}")
     print("ok")
@@ -433,6 +496,8 @@ def cmd_run_set(args) -> None:
 def cmd_lane_add(args) -> None:
     run = resolve_run(args.run)
     effort_rank(args.effort)
+    if args.token_budget is not None and args.token_budget <= 0:
+        raise LaneError("token budget must be positive")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", args.id):
         raise LaneError("lane id must be 1–64 letters, digits, underscores or hyphens")
     if args.kind == "review" and not args.review_of:
@@ -450,6 +515,8 @@ def cmd_lane_add(args) -> None:
         if worktree == "auto":
             worktree = str(run.path / "worktrees" / args.id)
         if worktree and args.create_worktree and args.kind != "review":
+            if not args.branch:
+                raise LaneError("--create-worktree requires --branch")
             branch_exists = git("rev-parse", "--verify", "--quiet", f"refs/heads/{args.branch}",
                                 cwd=repo, check=False)
             if branch_exists:
@@ -466,14 +533,24 @@ def cmd_lane_add(args) -> None:
             "state": "queued" if args.queued else "planned", "blocked_by": csv(args.blocked_by),
             "attempt": 0, "session": None, "pid": None, "pr": None, "override": args.override,
             "created": now(),
+            "no_validation_required": args.no_validation_required,
+            "token_budget": args.token_budget,
         }
         if args.kind == "review":
             lane_review.register(sys.modules[__name__], run, data, lane, args.review_of)
         data["lanes"][args.id] = lane
         run.lane_dir(args.id).mkdir(parents=True, exist_ok=True)
+        lane["environment"] = lane_runtime.reserve(sys.modules[__name__], run, args.id)
+        ok, setup_lines = lane_runtime.setup(sys.modules[__name__], data, lane) if lane.get("worktree") else (True, [])
+        if not ok:
+            lane["state"] = "blocked"
     if args.override:
         run.note("directive", f"{args.id} effort {args.effort}. User instruction: {args.override}")
     print(f"lane {args.id} added ({args.tool}/{args.model}@{args.effort})")
+    if args.no_validation_required:
+        run.note("directive", args.no_validation_required)
+    if not ok:
+        raise LaneError("setup blocked: " + "; ".join(setup_lines))
 
 
 def cmd_lane_set(args) -> None:
@@ -481,7 +558,7 @@ def cmd_lane_set(args) -> None:
     with run.locked() as data:
         lane = get_lane(data, args.id)
         if lane.get("state") == "running" and any(getattr(args, key) is not None
-                                                  for key in ("model", "effort", "branch", "owns", "validate")):
+                                                  for key in ("model", "effort", "branch", "owns", "validate", "token_budget")):
             raise LaneError("do not change a running lane's launch settings")
         if lane["kind"] == "review" and (args.owns or args.branch or args.validate):
             raise LaneError("reviewer ownership, branch and validation cannot be overridden")
@@ -505,6 +582,10 @@ def cmd_lane_set(args) -> None:
             lane["start"] = csv(args.start)
         if args.validate is not None:
             lane["validate"] = split_commands(args.validate)
+        if args.token_budget is not None:
+            if args.token_budget <= 0:
+                raise LaneError("token budget must be positive")
+            lane["token_budget"] = args.token_budget
     print("ok")
 
 
@@ -528,7 +609,11 @@ def check_command(run_path: Path | str, lane_id: str) -> str:
 
 
 def lane_validation(data: dict, lane: dict) -> list[str]:
-    return lane.get("validate") or data["rules"]["validate"]
+    commands = list(lane.get("validate") or data["rules"]["validate"])
+    scanner = data["rules"].get("secret_scan")
+    if scanner:
+        commands.append(scanner)
+    return commands
 
 
 def render_assignment(data: dict, lane: dict, run_path: Path) -> str:
@@ -542,6 +627,8 @@ def render_assignment(data: dict, lane: dict, run_path: Path) -> str:
         "reserves": ", ".join(lane["reserves"]) or "none",
         "validate": "; ".join(lane_validation(data, lane)) or "(as stated in the brief)",
         "protected": "; ".join(data["rules"]["protected"]) or "(as stated in the brief)",
+        "namespace": lane.get("environment", {}).get("LANE_NAMESPACE", "unassigned"),
+        "ports": lane.get("environment", {}).get("LANE_PORT_START", "?") + "-" + lane.get("environment", {}).get("LANE_PORT_END", "?"),
     }
     for key, value in values.items():
         template = template.replace("{" + key + "}", value)
@@ -560,7 +647,8 @@ def build_command(run: Run, data: dict, lane: dict, prompt: str, resume: bool, a
                         "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk",
                         "--append-system-prompt", "{contract}", "--tools", "Read,Glob,Grep",
                         "--strict-mcp-config", "--mcp-config", NO_MCP, "--disable-slash-commands",
-                        "--settings", '{"disableAllHooks":true}', "--disallowedTools", "Edit,Write,Bash,Agent,Read(**/.env*)",
+                        "--settings", '{"disableAllHooks":true,"attribution":{"commit":"","pr":"","sessionUrl":false}}',
+                        "--disallowedTools", "Edit,Write,Bash,Agent,Read(**/.env*)",
                         "{budget_args}"]
             if resume:
                 template += ["--resume", "{session}"]
@@ -635,10 +723,17 @@ def start(run: Run, lane_id: str, message_file: str | None, resume: bool, dry_ru
         elif resume:
             if not text.strip():
                 raise LaneError("send needs --message-file")
+            if lane["kind"] != "research" and (lane.get("setup", {}).get("status") != "pass"
+                    or lane["setup"]["fingerprint"] != lane_runtime.setup_fingerprint(data, lane)):
+                raise LaneError("lane setup is missing or stale; run 'lanectl setup' before resuming")
             prompt = text
         else:
             if not text.strip():
                 raise LaneError("launch needs --brief-file")
+            lane_runtime.ready(sys.modules[__name__], data, lane, text)
+            draft = lane.get("brief_draft")
+            if draft and (not draft["approved"] or lane_cache.digest(text) != draft["sha256"]):
+                raise LaneError("generated brief needs coordinator approval; edited drafts need reapproval")
             prompt = render_assignment(data, lane, run.path) + "\n\n" + text
             template = run_adapters(data)[lane["tool"]]["new"]
             if not any("{contract}" in token for token in template) and data.get("codex_contract") != "developer":
@@ -646,6 +741,8 @@ def start(run: Run, lane_id: str, message_file: str | None, resume: bool, dry_ru
         if lane["kind"] == "review" and lane["tool"] == "codex" and not resume and data.get("codex_contract") != "developer":
             prompt = lane_cache.contract(data, lane, PLUGIN_ROOT) + "\n\n" + prompt
         attempt = lane.get("attempt", 0) + 1
+        if lane.get("token_budget") and sum(u.get("in", 0) + u.get("out", 0) for u in lane.get("usage", {}).values()) >= lane["token_budget"]:
+            raise LaneError("reported token budget is exhausted; choose a new budget before continuing")
         command = build_command(run, data, lane, prompt, resume, attempt)
         if dry_run:
             contract = lane_cache.contract(data, lane, PLUGIN_ROOT)
@@ -666,7 +763,7 @@ def start(run: Run, lane_id: str, message_file: str | None, resume: bool, dry_ru
         atomic_write(ldir / f"attempt-{attempt}.prompt.md", prompt)
         cwd = lane.get("worktree") or data["repo"]
         proc = subprocess.Popen(
-            [sys.executable, str(SCRIPT), "_supervise", str(ldir), str(attempt), cwd],
+            [sys.executable, str(SCRIPT), "_supervise", str(ldir), str(attempt), cwd, str(run.path), lane_id],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
@@ -703,6 +800,11 @@ def cmd_launch_group(args) -> None:
             raise LaneError(f"empty brief for {lane_id}")
         if lane["kind"] == "review":
             lane_review.launch_prompt(sys.modules[__name__], data, lane)
+        else:
+            lane_runtime.ready(sys.modules[__name__], data, lane, text)
+            draft = lane.get("brief_draft")
+            if draft and (not draft["approved"] or lane_cache.digest(text) != draft["sha256"]):
+                raise LaneError(f"{lane_id} generated brief needs approval/reapproval")
         template = run_adapters(data)[lane["tool"]]["new"]
         shared = lane_cache.contract(data, lane, PLUGIN_ROOT)
         # Group hints are candidates, not a promise of identical hidden CLI context.
@@ -770,18 +872,38 @@ def cmd_supervise(args) -> None:
     command = json.loads((ldir / f"attempt-{attempt}.cmd.json").read_text(encoding="utf-8"))
     with open(ldir / f"attempt-{attempt}.jsonl", "w") as out, open(ldir / f"attempt-{attempt}.err", "w") as err:
         try:
-            proc = subprocess.Popen(command, cwd=args.cwd, stdin=subprocess.DEVNULL, stdout=out, stderr=err)
+            data = resolve_run(args.run_path).read() if args.run_path else {}
+            lane = get_lane(data, args.lane_id) if args.lane_id else {}
+            env = lane_runtime.environment(data, lane) if lane else None
+            proc = subprocess.Popen(command, cwd=args.cwd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                    start_new_session=True)
             atomic_write(ldir / f"attempt-{attempt}.child", str(proc.pid))
 
             def forward(signum, _frame):
                 with contextlib.suppress(ProcessLookupError):
-                    proc.send_signal(signum)
+                    os.killpg(proc.pid, signum)
 
             signal.signal(signal.SIGINT, forward)
             signal.signal(signal.SIGTERM, forward)
-            code = proc.wait()
-        except FileNotFoundError as exc:
-            err.write(f"{exc}\n")
+            budget = lane.get("token_budget")
+            previous = sum(u.get("in", 0) + u.get("out", 0) for key, u in lane.get("usage", {}).items() if key != str(attempt))
+            while proc.poll() is None:
+                if budget:
+                    info = parse_stream(ldir / f"attempt-{attempt}.jsonl", lane["tool"])
+                    if previous + info["tokens_in"] + info["tokens_out"] >= budget:
+                        atomic_write(ldir / f"attempt-{attempt}.guard", "reported token threshold reached; counts can arrive late")
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(proc.pid, signal.SIGTERM)
+                        break
+                time.sleep(0.25)
+            try:
+                code = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                code = proc.wait()
+        except (OSError, ValueError, KeyError):
+            err.write("lane executable or environment configuration unavailable\n")
             code = 127
     atomic_write(ldir / f"attempt-{attempt}.exit", f"{code}\n")
 
@@ -959,11 +1081,15 @@ def cmd_cleanup(args) -> None:
     run = resolve_run(args.run)
     with run.locked() as data:
         lane = get_lane(data, args.id)
+        refresh(run, data, lane)
+        if lane["state"] == "running":
+            raise LaneError("stop the lane before cleanup")
         repo = Path(data["repo"])
         done = []
         if args.remove_worktree and lane.get("worktree") and Path(lane["worktree"]).exists():
             git("worktree", "remove", lane["worktree"], cwd=repo)
             done.append("worktree removed")
+            lane_runtime.release(sys.modules[__name__], run, args.id)
         if args.delete_branch and lane.get("branch"):
             git("branch", "-d", lane["branch"], cwd=repo)
             done.append(f"branch {lane['branch']} deleted")
@@ -1055,6 +1181,14 @@ def failure_lines(output: str, tail: int) -> list[str]:
 
 
 def run_checks(data: dict, lane: dict, timeout: float, tail: int) -> tuple[bool, list[str]]:
+    if lane["kind"] not in ("review", "research"):
+        try:
+            lane_runtime.isolated(sys.modules[__name__], data, lane)
+            if (lane.get("setup", {}).get("status") != "pass"
+                    or lane["setup"]["fingerprint"] != lane_runtime.setup_fingerprint(data, lane)):
+                return False, ["FAIL setup missing/stale; run 'lanectl setup' before validation"]
+        except (LaneError, ValueError, OSError, KeyError, subprocess.TimeoutExpired):
+            return False, ["FAIL validation needs an isolated prepared worktree"]
     commands = lane_validation(data, lane)
     if not commands:
         return True, ["no validation commands configured"]
@@ -1064,11 +1198,15 @@ def run_checks(data: dict, lane: dict, timeout: float, tail: int) -> tuple[bool,
         began = time.monotonic()
         try:
             proc = subprocess.run(command, shell=True, cwd=cwd, text=True, capture_output=True,
-                                  timeout=timeout, stdin=subprocess.DEVNULL)
+                                  timeout=timeout, stdin=subprocess.DEVNULL, env=lane_runtime.environment(data, lane))
             code, output = proc.returncode, proc.stdout + "\n" + proc.stderr
         except subprocess.TimeoutExpired:
             code, output = 124, f"timed out after {timeout:.0f}s"
         secs = time.monotonic() - began
+        if command == data["rules"].get("secret_scan"):
+            ok &= code == 0
+            out.append(f"{'PASS' if code == 0 else 'FAIL'} secret scan (exit {code}; output redacted)")
+            continue
         if code == 0:
             out.append(f"PASS {command} ({secs:.0f}s)")
         else:
@@ -1085,6 +1223,9 @@ def cmd_check(args) -> None:
     print("\n".join(lines))
     if not ok:
         sys.exit(4)
+    if args.baseline_command and not lane_integration.baseline(sys.modules[__name__], run, data, get_lane(data, args.id),
+                                                             args.baseline_command, args.timeout, args.tail):
+        raise LaneError("baseline evidence is inconclusive or tests also pass on base")
 
 
 # ---------------------------------------------------------------- repository map
@@ -1142,11 +1283,11 @@ def fmt_secs(secs: float | None) -> str:
 
 
 def lane_usage(lane: dict) -> dict:
-    total = {"attempts": len(lane.get("usage", {})), "fresh": 0, "cache_write": 0, "cache_read": 0,
+    total = {"attempts": len(lane.get("usage", {})), "in": 0, "fresh": 0, "cache_write": 0, "cache_read": 0,
              "out": 0, "cost_usd": 0.0, "secs": 0, "first_calls": [], "cache_write_known": True,
              "cost_known": True}
     for usage in lane.get("usage", {}).values():
-        for key in ("fresh", "cache_write", "cache_read", "out", "secs"):
+        for key in ("in", "fresh", "cache_write", "cache_read", "out", "secs"):
             total[key] += usage.get(key) or 0
         total["cost_usd"] += usage.get("cost_usd") or 0.0
         total["cache_write_known"] &= usage.get("cache_write") is not None
@@ -1167,7 +1308,7 @@ def cmd_usage(args) -> None:
         for lane in data["lanes"].values():
             refresh(run, data, lane)
     rows = {lane_id: lane_usage(lane) for lane_id, lane in data["lanes"].items()}
-    keys = ("fresh", "cache_write", "cache_read", "out", "cost_usd", "secs", "attempts")
+    keys = ("in", "fresh", "cache_write", "cache_read", "out", "cost_usd", "secs", "attempts")
     totals = {key: sum(row[key] or 0 for row in rows.values()) for key in keys}
     totals["cache_write_known"] = all(row["cache_write_known"] for row in rows.values())
     totals["cost_known"] = all(row["cost_known"] for row in rows.values())
@@ -1230,8 +1371,12 @@ def queue_lines(data: dict) -> list[str]:
     lines, head = [], None
     for position, lane in enumerate(queued, 1):
         hold = reserve_hold(data, lane)
+        if any(get_lane(data, dep)["state"] != "merged" for dep in lane["blocked_by"]):
+            hold = "waits for dependencies"
         if lane.get("needs_rebase"):
             hold = "needs rebase"
+        if not hold and data.get("integration_required") and not lane_integration.current(sys.modules[__name__], data):
+            hold = "needs integration proof"
         if not hold and head is None:
             head = lane["id"]
         label = "next" if head == lane["id"] else (hold or "waiting")
@@ -1291,22 +1436,25 @@ def sync_lanes(run: Run, data: dict, fetch: bool, check: bool, timeout: float, t
         if subprocess.run(["git", "merge-base", "--is-ancestor", target, "HEAD"], cwd=worktree,
                           capture_output=True).returncode == 0:
             lane.update({"base": target, "needs_rebase": False})
-            out.append(f"{lane_id} up to date")
-            continue
-        proc = subprocess.run(["git", "rebase", "--quiet", target], cwd=worktree, text=True, capture_output=True)
-        if proc.returncode != 0:
-            conflicts = git("diff", "--name-only", "--diff-filter=U", cwd=worktree, check=False).split()
-            git("rebase", "--abort", cwd=worktree, check=False)
-            lane["needs_rebase"] = True
-            out.append(f"{lane_id} conflict in {', '.join(conflicts) or 'unknown files'}: send it the REBASE instruction")
-            continue
-        lane.update({"base": target, "needs_rebase": False})
-        line = f"{lane_id} rebased cleanly onto {target}"
-        if lane.get("pr") or lane.get("state") == "merge-queued":
-            line += "; push with --force-with-lease"
+            line = f"{lane_id} up to date"
+        else:
+            proc = subprocess.run(["git", "rebase", "--quiet", target], cwd=worktree, text=True, capture_output=True)
+            if proc.returncode != 0:
+                conflicts = git("diff", "--name-only", "--diff-filter=U", cwd=worktree, check=False).split()
+                git("rebase", "--abort", cwd=worktree, check=False)
+                lane["needs_rebase"] = True
+                out.append(f"{lane_id} conflict in {', '.join(conflicts) or 'unknown files'}: send it the REBASE instruction")
+                continue
+            lane.update({"base": target, "needs_rebase": False})
+            line = f"{lane_id} rebased cleanly onto {target}"
+            if lane.get("pr") or lane.get("state") == "merge-queued":
+                line += "; push with --force-with-lease"
         if check:
             ok, lines = run_checks(data, lane, timeout, tail)
             line += "; check pass" if ok else "; check FAILED:\n" + "\n".join(lines)
+            if not ok:
+                lane["state"] = "blocked"
+                lane.pop("review_approval", None)
         out.append(line)
     return out
 
@@ -1316,6 +1464,8 @@ def cmd_sync(args) -> None:
     with run.locked() as data:
         lines = sync_lanes(run, data, not args.no_fetch, args.check, args.timeout, args.tail)
     print("\n".join(lines) if lines else "no lanes to sync")
+    if args.check and any("check FAILED" in line for line in lines):
+        sys.exit(4)
 
 
 def cmd_merged(args) -> None:
@@ -1332,6 +1482,8 @@ def cmd_merged(args) -> None:
     if lines:
         print("\n".join(lines))
     print("queue: " + ("; ".join(queue) if queue else "empty"))
+    if args.check and any("check FAILED" in line for line in lines):
+        sys.exit(4)
 
 
 # ---------------------------------------------------------------- parser
@@ -1353,6 +1505,8 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--codex-contract", choices=("prompt", "developer"), default="prompt",
                      help="developer is an opt-in cache-boundary experiment")
     new.add_argument("--codex-developer-prefix-file", help="preserve effective existing developer instructions for experiment")
+    new.add_argument("--setup"); new.add_argument("--setup-not-required", action="store_true")
+    new.add_argument("--env-template-file"); new.add_argument("--integration", choices=("required", "optional"))
     new.set_defaults(func=cmd_run_new)
     lst = run_sub.add_parser("list")
     lst.add_argument("--repo", default=".")
@@ -1366,6 +1520,8 @@ def build_parser() -> argparse.ArgumentParser:
     rset.add_argument("--protected", help="comma-separated protected environments/rules")
     rset.add_argument("--risk-patterns", help="additional comma-separated sensitive path globs")
     rset.add_argument("--state", choices=("open", "closed"))
+    rset.add_argument("--setup"); rset.add_argument("--setup-not-required", action="store_true")
+    rset.add_argument("--env-template-file"); rset.add_argument("--integration", choices=("required", "optional"))
     rset.set_defaults(func=cmd_run_set)
 
     lane = sub.add_parser("lane", help="Add or update lanes.")
@@ -1389,6 +1545,8 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--allow", default="", help="extra allowed tool rules (claude)")
     add.add_argument("--deny", default="", help="extra denied tool rules (claude)")
     add.add_argument("--budget-usd", type=float)
+    add.add_argument("--token-budget", type=int, help="soft reported-token limit; may overshoot within a CLI turn")
+    add.add_argument("--no-validation-required", help="user directive waiving validation for this lane")
     add.add_argument("--start", default="", help="comma-separated files the lane should open first (from map)")
     add.add_argument("--validate", help="this lane's validation commands, ';'-separated (default: the run's)")
     add.add_argument("--extra-tools", default="", help="extra Claude tools, e.g. WebFetch,WebSearch")
@@ -1408,6 +1566,7 @@ def build_parser() -> argparse.ArgumentParser:
     lset.add_argument("--owns")
     lset.add_argument("--start")
     lset.add_argument("--validate")
+    lset.add_argument("--token-budget", type=int)
     lset.set_defaults(func=cmd_lane_set)
 
     launch = sub.add_parser("launch", help="Start a lane's first turn in the background.")
@@ -1496,6 +1655,7 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--id", required=True)
     check.add_argument("--timeout", type=float, default=1800)
     check.add_argument("--tail", type=int, default=30)
+    check.add_argument("--baseline-command", help="optional test-only regression command to run on base")
     check.set_defaults(func=cmd_check)
 
     mapper = sub.add_parser("map", help="Rank files and definitions matching ticket terms.")
@@ -1546,8 +1706,12 @@ def build_parser() -> argparse.ArgumentParser:
     sup.add_argument("lane_dir")
     sup.add_argument("attempt", type=int)
     sup.add_argument("cwd")
+    sup.add_argument("run_path", nargs="?"); sup.add_argument("lane_id", nargs="?")
     sup.set_defaults(func=cmd_supervise)
     lane_review.add_parsers(sys.modules[__name__], sub)
+    lane_runtime.add_parsers(sys.modules[__name__], sub)
+    lane_planning.add_parsers(sys.modules[__name__], sub)
+    lane_integration.add_parsers(sys.modules[__name__], sub)
     return parser
 
 
@@ -1555,7 +1719,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         args.func(args)
-    except LaneError as exc:
+    except (LaneError, ValueError, OSError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0

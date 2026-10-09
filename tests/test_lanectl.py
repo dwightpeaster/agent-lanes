@@ -98,7 +98,10 @@ class LaneCtlTest(unittest.TestCase):
         return proc
 
     def new_run(self) -> str:
-        return self.ctl("run", "new", "--repo", ".", "--name", "Wave one", "--base", "main").stdout.splitlines()[0]
+        run = self.ctl("run", "new", "--repo", ".", "--name", "Wave one", "--base", "main",
+                       "--integration", "optional").stdout.splitlines()[0]
+        self.ctl("run", "set", "--run", run, "--validate", "echo fixture-validation")
+        return run
 
     def add_lane(self, run: str, lane_id: str, tool: str = "claude", **extra) -> None:
         args = ["lane", "add", "--run", run, "--id", lane_id, "--items", f"T-{lane_id}", "--tool", tool,
@@ -110,6 +113,8 @@ class LaneCtlTest(unittest.TestCase):
         self.ctl(*args)
 
     def brief(self, text: str = "Goal: do it") -> str:
+        if text.startswith("Goal:") and "Acceptance:" not in text:
+            text += "\nAcceptance:\n- Complete the specified fixture task.\n"
         path = Path(self.temp.name) / f"brief-{time.monotonic_ns()}.md"
         path.write_text(text)
         return str(path)

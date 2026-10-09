@@ -97,7 +97,9 @@ class ReviewCacheTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
         self.assertIn("--exclude-dynamic-system-prompt-sections", argv)
         self.assertIn("Edit,Write,Bash,Agent,Read(**/.env*)", argv)
-        self.assertIn('{"disableAllHooks":true}', argv)
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertTrue(settings["disableAllHooks"])
+        self.assertEqual(settings["attribution"], {"commit": "", "pr": "", "sessionUrl": False})
 
     def test_codex_review_is_read_only_without_writable_gitdir_or_connectors(self):
         run = self.review_fixture(tool="codex")
@@ -279,7 +281,7 @@ class ReviewCacheTest(unittest.TestCase):
         run = self.new_run(); self.add_lane(run, "L1"); self.add_lane(run, "L2")
         briefs = self.brief(json.dumps({"L1": self.brief(), "L2": self.brief()}))
         self.ctl("launch-group", "--run", run, "--briefs-file", briefs, "--warm-cache", "--warm-timeout", "3")
-        self.wait_for(run)
+        self.ctl("wait", "--run", run, "--timeout", "20", "--interval", "0.2", "--settle", "1")
         self.assertEqual(len(self.calls()), 2)
         self.assertIn("cache_profile", self.state(run)["lanes"]["L1"])
         self.add_lane(run, "L3"); self.add_lane(run, "L4")
@@ -297,6 +299,7 @@ class ReviewCacheTest(unittest.TestCase):
         run = self.ctl("run", "new", "--repo", ".", "--name", "experiment", "--base", "main",
                        "--codex-contract", "developer", "--codex-developer-prefix-file",
                        self.brief("Keep existing policy.")).stdout.strip()
+        self.ctl("run", "set", "--run", run, "--validate", "echo fixture-validation")
         self.add_lane(run, "L1", tool="codex")
         self.ctl("launch", "--run", run, "--id", "L1", "--brief-file", self.brief())
         self.wait_for(run)
