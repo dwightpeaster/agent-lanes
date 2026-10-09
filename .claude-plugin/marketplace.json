@@ -9,7 +9,7 @@
       "name": "agent-lanes",
       "source": "./plugins/agent-lanes",
       "description": "Coordinate parallel Claude Code and Codex sub-agents in focused, token-efficient lanes.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "displayName": "Agent Lanes",
       "repository": "https://github.com/dwightpeaster/agent-lanes",
       "license": "MIT",

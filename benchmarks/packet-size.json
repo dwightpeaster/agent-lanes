@@ -1,0 +1,12 @@
+{
+  "benchmark": "synthetic local packet size, no model calls",
+  "original_diff_bytes": 180261,
+  "initial_packet_bytes": 1054,
+  "correction_diff_bytes": 127,
+  "correction_packet_bytes": 745,
+  "limitations": [
+    "bytes are not tokens",
+    "large patches remain available for reviewer inspection",
+    "simulated findings are not an actual model review"
+  ]
+}

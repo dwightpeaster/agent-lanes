@@ -40,4 +40,4 @@ Resumed lanes keep their own sessions; `lanectl send` reaches them from any coor
 
 ## Closing a run
 
-Once every lane is merged or closed, give the user a final summary (merged, follow-ups, anything not exercised), then `lanectl run set --run <dir> --state closed`.
+Once every lane is merged or closed, give the user a final summary (merged, follow-ups, anything not exercised, and the totals line from `lanectl usage`), then `lanectl run set --run <dir> --state closed`.
