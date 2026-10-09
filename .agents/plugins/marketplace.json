@@ -1,0 +1,20 @@
+{
+  "name": "agent-lanes",
+  "interface": {
+    "displayName": "Agent Lanes"
+  },
+  "plugins": [
+    {
+      "name": "agent-lanes",
+      "source": {
+        "source": "local",
+        "path": "./plugins/agent-lanes"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

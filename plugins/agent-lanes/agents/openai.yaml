@@ -1,0 +1,8 @@
+interface:
+  display_name: "Agent Lanes"
+  short_description: "Coordinate parallel agent lanes"
+  brand_color: "#0F766E"
+  default_prompt: "Use $agent-lanes to coordinate parallel lanes for this project."
+
+policy:
+  allow_implicit_invocation: false

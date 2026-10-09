@@ -1,0 +1,10 @@
+{
+  "name": "agent-lanes",
+  "description": "Coordinate parallel Claude Code and Codex sub-agents in focused, token-efficient lanes.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "author": {
+    "name": "Dwight Peaster"
+  },
+  "skills": "./skills/"
+}

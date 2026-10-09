@@ -1,0 +1,32 @@
+[
+  {
+    "prompt": "$agent-lanes coordinate the ready tickets in this project across parallel lanes.",
+    "expected_skill": "agent-lanes",
+    "mutation_allowed": true
+  },
+  {
+    "prompt": "agent-lanes resume",
+    "expected_skill": "agent-lanes",
+    "mutation_allowed": true
+  },
+  {
+    "prompt": "agent-lanes status",
+    "expected_skill": "agent-lanes",
+    "mutation_allowed": false
+  },
+  {
+    "prompt": "agent-lanes handoff",
+    "expected_skill": "agent-lanes",
+    "mutation_allowed": true
+  },
+  {
+    "prompt": "Fix the typo in the README.",
+    "expected_skill": null,
+    "mutation_allowed": true
+  },
+  {
+    "prompt": "Explain how git worktrees work.",
+    "expected_skill": null,
+    "mutation_allowed": false
+  }
+]

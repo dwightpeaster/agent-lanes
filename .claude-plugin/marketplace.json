@@ -1,0 +1,30 @@
+{
+  "name": "agent-lanes",
+  "owner": {
+    "name": "Dwight Peaster"
+  },
+  "description": "Agent Lanes marketplace for Claude Code.",
+  "plugins": [
+    {
+      "name": "agent-lanes",
+      "source": "./plugins/agent-lanes",
+      "description": "Coordinate parallel Claude Code and Codex sub-agents in focused, token-efficient lanes.",
+      "version": "0.1.0",
+      "displayName": "Agent Lanes",
+      "repository": "https://github.com/dwightpeaster/agent-lanes",
+      "license": "MIT",
+      "author": {
+        "name": "Dwight Peaster"
+      },
+      "category": "productivity",
+      "tags": [
+        "agents",
+        "coordination",
+        "parallel",
+        "worktrees",
+        "codex",
+        "claude-code"
+      ]
+    }
+  ]
+}
