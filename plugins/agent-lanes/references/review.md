@@ -33,7 +33,7 @@ lanectl send --run <dir> --id L1 --review-from R1
 
 Findings are checked against pinned source text and line numbers. This rejects stale or invented anchors, not semantic mistakes. Only validated blocking replacements are forwarded; follow-ups remain separate.  Another correction round needs explicit `--correction-override` authorization.
 
-After fixes, run `review prepare` again, then `send` to R1. It supplies the delta from the last validated review plus prior findings. Changed criteria or gates force a full review. Use `--target L2` to reuse R1 for another lane. Rewritten history needs a fresh reviewer. Stale approval cannot authorize a changed commit.
+After fixes, run `review prepare` again, then `send` to R1. It supplies the delta from the last validated review plus prior findings. Changed criteria or gates force a full review. Use `--target L2` to reuse R1 for another lane. Rewritten history needs a fresh reviewer. A rebase keeps approval only if the lane's changes are identical.
 
 ## Merge and follow up
 

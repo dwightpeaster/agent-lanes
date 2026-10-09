@@ -1,21 +1,43 @@
 # Changelog
 
-### Additional v0.2.0 changes
+## 0.2.1 — 2026-10-09
 
-- Fix `sync --check` skipping validation for already-current branches; propagate check failures through sync/merged exit codes.
-- Add fingerprinted dependency setup, shared download caches, cross-run test namespaces/port leases, runtime environment templates and launch readiness checks.
-- Generate normalized ticket briefs with mapped start files/dependencies and explicit coordinator approval after assigning ownership.
-- Require disposable combined-result validation for new runs; bind proofs to exact commits, gates, environments and dependency/resource order. Add opt-in candidate/base regression evidence and redacted configured secret scanners.
-- Add compact exact-commit CI, run summaries and paired completed-run comparisons including reported cache writes. Keep unreported coordinator cost and dollar savings unknown.
-- Add soft reported-token limits with explicit blocked state; document macOS/Linux support. Disable Claude attribution in lane defaults and repository settings; omit agent co-author trailers.
-- Freeze role contracts per run and adapter overrides on first use; canonicalize Claude extra tools. Use supported dynamic-system-context exclusion and explicit system-prompt snapshots.
-- Add configuration fingerprints, deduplicated first-call Claude cache samples, and unknown values for unreported Codex cache-write counts and cost.
-- Add optional `launch-group --warm-cache`, preserving unstarted followers after timeout/failure. Add an opt-in Codex developer-instruction boundary experiment and a reproducible live CLI benchmark, requiring external-call authorization.
-- Require reviewer targets; create separate detached checkouts at exact commits. Add a dedicated JSON review contract. Claude reviewers have no Bash/Edit/Write/MCP/hooks; Codex reviewers have read-only shell sandboxing and separately disabled connectors/plugins/hooks/delegation/MCP.
-- Add `review prepare` with checks, scope, CI disposition, criteria, decisions and bounded inline diffs. Add `review findings` to verify source quotes/lines and separate blockers from follow-ups; `send --review-from` forwards only validated current blockers and enforces one correction round.
-- Re-review validated corrections with deltas. Reuse one reviewer sequentially across targets with a fresh packet. Changed gates/criteria require full review; stale approvals cannot queue a changed commit.
-- Add advisory, configurable `risk` recommendations; required reviews and sensitive changes cannot skip validated review at the merge queue.
-- Local synthetic packet measurement: 180,261 diff bytes became a 1,054-byte initial packet with patch references; a one-line fix produced a 127-byte delta. Reproduce it with `scripts/benchmark_packets.py`. This does not measure total model-token savings. New live benchmarks remain pending authorization.
+### Fixed
+
+- Claude reviewers can read their review packet. They ran in their own checkout without access to the packet folder, so every Claude review was denied. Reviewers now get `--add-dir` for their packet folder. A live test with real Claude lanes confirms it.
+- A clean rebase keeps a review approval only when the lane's own changes are identical (same `git patch-id`). Otherwise the approval is cleared and the lane leaves the merge queue for a correction review. Before, an approval for an older commit could still let a rebased lane through.
+- Brief text is no longer rewritten. Placeholders were also substituted inside the prompt, so a brief mentioning `{model}` or `{contract}` was corrupted.
+- `lanectl queue` and `merged` no longer fail on a lane with uncommitted changes or an unknown `--blocked-by` lane. The queue shows the reason instead.
+- `setup`, `lane add`, `review prepare`, `sync --check` and `merged --check` no longer hold the run lock while commands run. `status`, `wait` and `stop` stay responsive during long installs and tests.
+- A timeout now stops the whole process group, so installers and test runners don't keep writing into the worktree.
+- Codex reviewers disable only features the installed Codex knows and MCP servers it can address; anything else is reported as a warning instead of failing every Codex review.
+- Runs created before 0.2.0 keep working: their lanes don't need `lanectl setup`, and `sync --check` doesn't block them. After a merge that changes a lockfile, `sync --check` re-runs setup before checking.
+- Integration and baseline checkouts are removed after they finish, even when checks leave files behind. Failed integration checkouts are kept for inspection.
+- Untracked files left by checks (build output, coverage files) no longer block review, integration or the queue. Only uncommitted changes to tracked files do.
+- `lanectl brief` keeps a lane's explicit `--validate`, and the secret scanner no longer runs twice or counts as configured validation.
+- `launch-group --warm-cache` launches independent groups even when one group's leader fails, honours `--warm-timeout` above 60 seconds, and treats a Codex leader as warm once its first call returns.
+- `launch --dry-run` no longer saves anything to the run, and launches no longer fail when the CLI can't be inspected.
+- A free-text review policy such as "not required" or "No." no longer makes review mandatory.
+- `send` to a reviewer keeps the message, and works without one.
+- Claude reviewers load only your user settings, not project settings from the commit under review, and keep their lane's deny rules.
+- Timeouts and failed git commands print an error instead of a traceback.
+- Sensitive paths are matched as whole words, so `author.py` and `clock.py` no longer count as risky.
+- Numbered acceptance criteria are recognized.
+- Integration merges no longer depend on your git identity or run repository hooks.
+- `run new` accepts a base that doesn't resolve locally yet, as 0.1 did.
+- Dependency tool versions are read from the lane's worktree, so per-directory version managers give the right answer.
+- `run.json` keeps only a few per-call cache samples, and the token-budget watcher re-reads a lane's output only when it grows.
+- The cache benchmark measures implementation lanes with the flags they actually use.
+
+### Added
+
+- `tests/live_smoke.py`: an opt-in test that runs a real Claude implementation lane and a real Claude reviewer before a release. It fails on 0.2.0 and passes on 0.2.1.
+- `benchmarks/claude-cache-2026-10-09.json` with the raw measurements behind the README's token figures.
+
+### Upgrade Notes
+
+- Update the plugin as in the README. No run or repository changes are needed.
+- Lanes in runs created with 0.2.0 keep their state. A lane that 0.2.0 blocked only because of a stale setup can be unblocked with `lanectl setup`.
 
 ## 0.2.0 — 2026-10-09
 
@@ -40,6 +62,23 @@
 - `lanectl wait --settle` and `lanectl questions` for batching.
 - `lanectl usage` with fresh input, cache writes, cache reads, output, cost and time per lane.
 - README sections on token use and on updating, for users and agents.
+
+### Added: isolated lanes, gated reviews and integration
+
+- Fix `sync --check` skipping validation for already-current branches; propagate check failures through sync/merged exit codes.
+- Add fingerprinted dependency setup, shared download caches, cross-run test namespaces/port leases, runtime environment templates and launch readiness checks.
+- Generate normalized ticket briefs with mapped start files/dependencies and explicit coordinator approval after assigning ownership.
+- Require disposable combined-result validation for new runs; bind proofs to exact commits, gates, environments and dependency/resource order. Add opt-in candidate/base regression evidence and redacted configured secret scanners.
+- Add compact exact-commit CI, run summaries and paired completed-run comparisons including reported cache writes. Keep unreported coordinator cost and dollar savings unknown.
+- Add soft reported-token limits with explicit blocked state; document macOS/Linux support. Disable Claude attribution in lane defaults and repository settings; omit agent co-author trailers.
+- Freeze role contracts per run and adapter overrides on first use; canonicalize Claude extra tools. Use supported dynamic-system-context exclusion and explicit system-prompt snapshots.
+- Add configuration fingerprints, deduplicated first-call Claude cache samples, and unknown values for unreported Codex cache-write counts and cost.
+- Add optional `launch-group --warm-cache`, preserving unstarted followers after timeout/failure. Add an opt-in Codex developer-instruction boundary experiment and a reproducible live CLI benchmark, requiring external-call authorization.
+- Require reviewer targets; create separate detached checkouts at exact commits. Add a dedicated JSON review contract. Claude reviewers have no Bash/Edit/Write/MCP/hooks; Codex reviewers have read-only shell sandboxing and separately disabled connectors/plugins/hooks/delegation/MCP.
+- Add `review prepare` with checks, scope, CI disposition, criteria, decisions and bounded inline diffs. Add `review findings` to verify source quotes/lines and separate blockers from follow-ups; `send --review-from` forwards only validated current blockers and enforces one correction round.
+- Re-review validated corrections with deltas. Reuse one reviewer sequentially across targets with a fresh packet. Changed gates/criteria require full review; stale approvals cannot queue a changed commit.
+- Add advisory, configurable `risk` recommendations; required reviews and sensitive changes cannot skip validated review at the merge queue.
+- Local synthetic packet measurement: 180,261 diff bytes became a 1,054-byte initial packet with patch references; a one-line fix produced a 127-byte delta. Reproduce it with `scripts/benchmark_packets.py`. This does not measure total model-token savings. New live benchmarks remain pending authorization.
 
 ### Upgrade Notes
 

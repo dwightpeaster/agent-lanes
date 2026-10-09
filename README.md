@@ -128,8 +128,8 @@ Placeholders: `{prompt}`, `{model}`, `{effort}`, `{session}`, `{name}`, `{worktr
 
 Agent Lanes cuts tokens where they actually go:
 
-- **Lean Claude lanes.** A Claude Code session normally loads every built-in tool, your MCP connectors and your skills, and sends them again on every step. Lanes load only Read, Edit, Write, Glob, Grep and Bash, with no MCP servers or skills. Measured on Claude Code 2.1.295, this cuts the fixed cost per step from about 45,000 to 8,000 input tokens. A lane can opt back in with `--extra-tools` or `--mcp-config`. Codex lanes use your Codex setup unchanged.
-- **Stable shared rules.** Contracts are frozen per run, and adapter overrides are frozen on first use. Supported Claude CLIs move changing environment context after the system prompt. Tool ordering is deterministic and attempts record configuration fingerprints. Claude's earlier two-lane test reported cache writes falling from 1,859 to 982 (47%), while more input became cache reads; that is not a 47% reduction in total input. Cross-lane hits still depend on the full rendered prefix and provider routing. Codex keeps its existing prompt placement by default; a developer-instruction experiment is opt-in.
+- **Lean Claude lanes.** A Claude Code session normally loads every built-in tool, your MCP connectors and your skills, and sends them again on every step. Lanes load only Read, Edit, Write, Glob, Grep and Bash, with no MCP servers or skills. Measured on Claude Code 2.1.295, this cuts the fixed cost per step from about 45,000 to 8,000 input tokens ([raw data](benchmarks/claude-cache-2026-10-09.json)). A lane can opt back in with `--extra-tools` or `--mcp-config`. Codex lanes use your Codex setup unchanged.
+- **Stable shared rules.** Contracts are frozen per run, and adapter overrides are frozen on first use. Supported Claude CLIs move changing environment context after the system prompt. Tool ordering is deterministic and attempts record configuration fingerprints. In a [two-lane test](benchmarks/claude-cache-2026-10-09.json), the second lane's cache writes fell from 1,859 to 982 (47%), while more input became cache reads; that is not a 47% reduction in total input. Cross-lane hits still depend on the full rendered prefix and provider routing. Codex keeps its existing prompt placement by default; a developer-instruction experiment is opt-in.
 - **Less reading.** Each lane gets start files from `lanectl map`, so lanes don't each explore the repository. The contract tells lanes to search first, read only the line ranges they need, and never rewrite a whole file.
 - **Less output.** Lanes don't narrate or summarize between steps, never echo files or logs, write one-line commit messages, and end with a short fixed report. `lanectl check` returns only pass/fail and failing lines, so test logs never enter a lane's context.
 - **Cheaper review inputs.** Large changes arrive as a compact packet with per-file patch references. Re-review sends only the delta since a validated review. Small documentation-only changes may skip optional review after green gates; required reviews always win. One reviewer session can assess several small lanes sequentially with a fresh packet for each.
@@ -145,7 +145,7 @@ A [local synthetic packet benchmark](benchmarks/packet-size.json) used a 180,261
 
 - Claude lanes run with `acceptEdits`, only file, search and shell tools, no MCP servers or skills, an allowlist of read and local-git commands plus the repo's validation commands and `lanectl check`, and a denylist that blocks `git push`, `gh`, destructive resets and env-file reads.
 - Codex lanes run with `--sandbox workspace-write`, which has no network by default.
-- Reviewer lanes have separate restrictions: Claude has only Read, Glob and Grep, with no shell, editing, MCP or hooks. Codex uses `--sandbox read-only`, no writable git directory, and disabled apps, plugins, hooks, delegation and MCP servers. These reviewer settings cannot be replaced by adapter overrides.
+- Reviewer lanes have separate restrictions: Claude has only Read, Glob and Grep, with no shell, editing, MCP or hooks. It can read its review packet folder and loads only your user settings, never project settings from the commit under review. Codex uses `--sandbox read-only` with no writable git directory, and also disables the apps, plugins, hooks, delegation and MCP servers that the installed Codex lets it address; anything it can't disable is shown as a launch warning. These reviewer settings cannot be replaced by adapter overrides.
 - Lanes never touch the main checkout; each lane works in its own worktree.
 - A refused merge, push or deletion stops the run and hands you the exact command.
 
@@ -181,7 +181,12 @@ When the user asks to update Agent Lanes:
 4. Open runs keep working. Lanes started before the update keep their original session, contract and system prompt. New lanes get the new defaults.
 5. If `~/.agent-lanes/adapters.json` overrides a Claude launch command, the override still wins. Compare it with the defaults (`lanectl launch --dry-run`) and tell the user which new flags it lacks. Don't change it without asking.
 
-New runs snapshot shared contracts. Existing runs acquire a snapshot on their next command, while already-started sessions retain their earlier context. Existing implementation lanes need `lanectl setup` before further turns; old runs retain their integration opt-out until explicitly enabled. Old review lanes without `--review-of` must be replaced with exact-commit reviewers. Reviewer overrides are intentionally ignored; implementer overrides remain supported and freeze on first use. No global Codex configuration is changed.
+New runs snapshot shared contracts. Existing runs acquire a snapshot on their next command, while already-started sessions retain their earlier context. Runs created before 0.2.0 don't need `lanectl setup`; old runs retain their integration opt-out until explicitly enabled. Old review lanes without `--review-of` must be replaced with exact-commit reviewers. Reviewer overrides are intentionally ignored; implementer overrides remain supported and freeze on first use. No global Codex configuration is changed.
+
+### Upgrading to 0.2.1
+
+- No run or repository changes are needed. 0.2.1 fixes Claude reviewers (they couldn't read their review packet in 0.2.0), stale approvals after rebases, and several queue, setup and launch problems. See [CHANGELOG.md](CHANGELOG.md).
+- A lane that 0.2.0 blocked only because of a stale setup can be unblocked with `lanectl setup`.
 
 ### Upgrading to 0.2.0
 
@@ -193,6 +198,12 @@ New runs snapshot shared contracts. Existing runs acquire a snapshot on their ne
 
 ```bash
 python -m unittest discover -s tests -v
+```
+
+The unit tests use simulated CLIs. Before a release, also run the live smoke test. It runs a real Claude implementation lane and a real Claude reviewer in a scratch repository, and costs a few cents on Haiku:
+
+```bash
+python3 tests/live_smoke.py --yes-spend
 ```
 
 ## License

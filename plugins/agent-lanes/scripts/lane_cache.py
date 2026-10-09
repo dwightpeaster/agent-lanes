@@ -27,20 +27,24 @@ def contract(data: dict, lane: dict, root: Path) -> str:
     return data["contracts"][kind]
 
 
-@lru_cache(maxsize=4)
-def cli_info(tool: str) -> tuple[str, str]:
+@lru_cache(maxsize=8)
+def cli_info(executable: str) -> tuple[str, str]:
+    """Version and help text of the executable a lane actually runs. ("unknown", "") when it can't be
+    inspected: these only tune caching and labels, so they never block a launch or dry run."""
     try:
-        version = subprocess.run([tool, "--version"], capture_output=True, text=True, timeout=15)
-        help_result = subprocess.run([tool, "--help"], capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ValueError(f"cannot inspect {tool} CLI capabilities") from exc
+        version = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=15,
+                                 stdin=subprocess.DEVNULL)
+        help_result = subprocess.run([executable, "--help"], capture_output=True, text=True, timeout=15,
+                                     stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown", ""
     if version.returncode or help_result.returncode:
-        raise ValueError(f"cannot inspect {tool} CLI capabilities")
+        return "unknown", ""
     return version.stdout.strip(), help_result.stdout
 
 
-def claude_cache_flags() -> list[str]:
-    _, help_text = cli_info("claude")
+def claude_cache_flags(executable: str = "claude") -> list[str]:
+    _, help_text = cli_info(executable)
     result = []
     if "--exclude-dynamic-system-prompt-sections" in help_text:
         result.append("--exclude-dynamic-system-prompt-sections")
@@ -49,32 +53,54 @@ def claude_cache_flags() -> list[str]:
     return result
 
 
-def reviewer_codex_flags(cwd: str) -> list[str]:
-    # A read-only shell sandbox does not constrain MCP/app side effects. Disable those separately.
-    flags = ["--disable", "plugins", "--disable", "apps", "--disable", "hooks",
-             "--disable", "multi_agent", "--disable", "computer_use", "--disable", "browser_use",
-             "--disable", "browser_use_external", "--disable", "browser_use_full_cdp_access",
-             "--disable", "in_app_browser"]
-    result = subprocess.run(["codex", *flags, "mcp", "list", "--json"], cwd=cwd,
-                            capture_output=True, text=True, timeout=20)
-    if result.returncode:
-        raise ValueError("cannot enumerate reviewer MCP servers; refusing unsafe launch")
+REVIEWER_CODEX_DISABLE = ("plugins", "apps", "hooks", "multi_agent", "computer_use", "browser_use",
+                          "browser_use_external", "browser_use_full_cdp_access", "in_app_browser")
+
+
+@lru_cache(maxsize=4)
+def codex_features(executable: str = "codex") -> frozenset:
     try:
-        servers = json.loads(result.stdout)
-        if not isinstance(servers, list):
-            raise ValueError("expected server list")
-        for server in sorted(servers, key=lambda s: s["name"]):
-            name = server["name"]
-            if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
-                raise ValueError("unsupported server identifier")
+        result = subprocess.run([executable, "features", "list"], capture_output=True, text=True, timeout=20,
+                                stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return frozenset()
+    if result.returncode:
+        return frozenset()
+    return frozenset(line.split()[0] for line in result.stdout.splitlines() if line.strip())
+
+
+def reviewer_codex_flags(cwd: str, executable: str = "codex") -> tuple[list[str], list[str]]:
+    """Best-effort extra isolation for read-only Codex reviewers, on top of --sandbox read-only.
+
+    Only features this Codex version knows are disabled, and only configured MCP servers with plain
+    names are switched off. Anything that can't be applied becomes a warning, never a failed launch."""
+    warnings = []
+    known = codex_features(executable)
+    flags = [part for name in REVIEWER_CODEX_DISABLE if name in known for part in ("--disable", name)]
+    if not known:
+        warnings.append("could not list Codex features; reviewer relies on the read-only sandbox")
+    try:
+        result = subprocess.run([executable, *flags, "mcp", "list", "--json"], cwd=cwd, capture_output=True,
+                                text=True, timeout=20, stdin=subprocess.DEVNULL)
+        servers = json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        servers = None
+    if not isinstance(servers, list):
+        warnings.append("could not list Codex MCP servers; they stay as configured for this reviewer")
+        return flags, warnings
+    for server in sorted((item for item in servers if isinstance(item, dict)), key=lambda item: str(item.get("name"))):
+        name = str(server.get("name", ""))
+        if server.get("enabled") is False:
+            continue
+        if re.fullmatch(r"[A-Za-z0-9_-]+", name):
             flags += ["-c", f"mcp_servers.{name}.enabled=false"]
-    except (ValueError, KeyError, TypeError) as exc:
-        raise ValueError("cannot safely disable reviewer MCP servers") from exc
-    return flags
+        else:
+            warnings.append(f"MCP server {name!r} left enabled (name can't be addressed with -c)")
+    return flags, warnings
 
 
 def profile(tool: str, lane: dict, command: list[str], shared: str, prompt: str) -> dict:
-    version, _ = cli_info(tool)
+    version, _ = cli_info(command[0] if command else tool)
     mcp = lane.get("mcp_config")
     mcp_hash = mcp_digest(mcp)
     normalized = []

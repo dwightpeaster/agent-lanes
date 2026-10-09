@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import datetime as dt
 try:
     import fcntl
@@ -32,7 +33,7 @@ import lane_runtime
 import lane_planning
 import lane_integration
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 SCRIPT = Path(__file__).resolve()
 PLUGIN_ROOT = SCRIPT.parents[1]
 # The contract is identical for every lane, so it goes first (Claude: system prompt) where prompt
@@ -351,7 +352,7 @@ def refresh(run: Run, data: dict, lane: dict) -> dict:
     usage[str(attempt)] = {"in": info["tokens_in"], "out": info["tokens_out"], "cost_usd": info["cost_usd"],
                            "fresh": info["fresh"], "cache_write": info["cache_write"],
                            "cache_read": info["cache_read"], "secs": secs,
-                           "first_call": info["first_call"], "model_calls": list(info["model_calls"].values()),
+                           "first_call": info["first_call"], "model_calls": list(info["model_calls"].values())[:3],
                            "cache_profile": lane.get("cache_profile"), "resumed": attempt > 1}
     if lane.get("state") == "running":
         if exit_file.exists():
@@ -408,7 +409,7 @@ def cmd_run_new(args) -> None:
         raise LaneError(f"run already exists: {path}")
     data = {
         "schema": 2, "id": run_id, "name": args.name, "repo": str(root), "base": args.base,
-        "initial_base_sha": git("rev-parse", args.base, cwd=root),
+        "initial_base_sha": git("rev-parse", "--verify", "--quiet", args.base, cwd=root, check=False) or None,
         "environment_templates": json.loads(Path(args.env_template_file).read_text()) if args.env_template_file
                                  else json.loads(profile.get("lane_env", "{}")),
         "integration_required": (args.integration or profile.get("integration", "required")) == "required",
@@ -541,9 +542,9 @@ def cmd_lane_add(args) -> None:
         data["lanes"][args.id] = lane
         run.lane_dir(args.id).mkdir(parents=True, exist_ok=True)
         lane["environment"] = lane_runtime.reserve(sys.modules[__name__], run, args.id)
-        ok, setup_lines = lane_runtime.setup(sys.modules[__name__], data, lane) if lane.get("worktree") else (True, [])
-        if not ok:
-            lane["state"] = "blocked"
+    ok, setup_lines = True, []
+    if lane.get("worktree") and args.kind not in ("review", "research"):
+        ok, setup_lines = lane_runtime.prepare(sys.modules[__name__], run, args.id, 600)
     if args.override:
         run.note("directive", f"{args.id} effort {args.effort}. User instruction: {args.override}")
     print(f"lane {args.id} added ({args.tool}/{args.model}@{args.effort})")
@@ -608,8 +609,13 @@ def check_command(run_path: Path | str, lane_id: str) -> str:
     return f"python3 {shlex.quote(str(SCRIPT))} check --run {shlex.quote(str(run_path))} --id {lane_id}"
 
 
+def lane_gates(data: dict, lane: dict) -> list[str]:
+    """The lane's own validation commands, without the always-appended secret scanner."""
+    return list(lane.get("validate") or data["rules"]["validate"])
+
+
 def lane_validation(data: dict, lane: dict) -> list[str]:
-    commands = list(lane.get("validate") or data["rules"]["validate"])
+    commands = lane_gates(data, lane)
     scanner = data["rules"].get("secret_scan")
     if scanner:
         commands.append(scanner)
@@ -648,7 +654,12 @@ def build_command(run: Run, data: dict, lane: dict, prompt: str, resume: bool, a
                         "--append-system-prompt", "{contract}", "--tools", "Read,Glob,Grep",
                         "--strict-mcp-config", "--mcp-config", NO_MCP, "--disable-slash-commands",
                         "--settings", '{"disableAllHooks":true,"attribution":{"commit":"","pr":"","sessionUrl":false}}',
-                        "--disallowedTools", "Edit,Write,Bash,Agent,Read(**/.env*)",
+                        # Project settings come from the commit under review; load only the user's own.
+                        "--setting-sources", "user",
+                        # The packet and patch files live outside the reviewer's checkout.
+                        "--add-dir", "{review_dir}",
+                        "--disallowedTools", ",".join(["Edit", "Write", "Bash", "Agent", "Read(**/.env*)",
+                                                       *lane.get("deny", [])]),
                         "{budget_args}"]
             if resume:
                 template += ["--resume", "{session}"]
@@ -656,10 +667,9 @@ def build_command(run: Run, data: dict, lane: dict, prompt: str, resume: bool, a
             template = ["codex", "exec", "--json", "-o", "{last}", "-m", "{model}",
                         "-c", "model_reasoning_effort={effort}", "--sandbox", "read-only",
                         "-c", 'approval_policy="never"', "-C", "{worktree}"]
-            try:
-                template += lane_cache.reviewer_codex_flags(lane["worktree"])
-            except ValueError as exc:
-                raise LaneError(str(exc)) from exc
+            flags, warnings = lane_cache.reviewer_codex_flags(lane["worktree"])
+            template += flags
+            lane["launch_warnings"] = warnings
             if resume:
                 # Parent exec options retain the read-only policy on resume.
                 template += ["resume", "{session}"]
@@ -688,20 +698,17 @@ def build_command(run: Run, data: dict, lane: dict, prompt: str, resume: bool, a
         "{contract}": lane_cache.contract(data, lane, PLUGIN_ROOT),
         "{tools}": ",".join(LANE_TOOLS + sorted(set(lane.get("extra_tools", [])) - set(LANE_TOOLS))),
         "{mcp_config}": lane.get("mcp_config") or NO_MCP,
+        "{review_dir}": str(run.lane_dir(lane["id"]) / "reviews"),
     }
     command: list[str] = []
     for token in template:
         if token in lists:
             command.extend(lists[token])
             continue
-        for key, value in scalars.items():
-            token = token.replace(key, value)
-        command.append(token)
+        # One pass, so text inside a substituted value (a brief that mentions {model}) is never rewritten.
+        command.append(re.sub(r"\{[a-z_]+\}", lambda match: scalars.get(match.group(0), match.group(0)), token))
     if tool == "claude" and (review or template == DEFAULT_ADAPTERS["claude"]["resume" if resume else "new"]):
-        try:
-            command += lane_cache.claude_cache_flags()
-        except ValueError as exc:
-            raise LaneError(str(exc)) from exc
+        command += lane_cache.claude_cache_flags(command[0])
     if tool == "codex" and data.get("codex_contract") == "developer":
         combined = data.get("codex_developer_prefix", "") + "\n\n" + scalars["{contract}"]
         command[2:2] = ["-c", "developer_instructions=" + json.dumps(combined)]
@@ -709,7 +716,8 @@ def build_command(run: Run, data: dict, lane: dict, prompt: str, resume: bool, a
 
 
 def start(run: Run, lane_id: str, message_file: str | None, resume: bool, dry_run: bool) -> None:
-    with run.locked() as data:
+    # A dry run works on a copy, so it never freezes adapters or contracts into the run.
+    with (contextlib.nullcontext(run.read()) if dry_run else run.locked()) as data:
         lane = get_lane(data, lane_id)
         refresh(run, data, lane)
         if lane["state"] == "running":
@@ -720,11 +728,12 @@ def start(run: Run, lane_id: str, message_file: str | None, resume: bool, dry_ru
         text = Path(message_file).read_text(encoding="utf-8") if message_file else ""
         if lane["kind"] == "review":
             prompt = lane_review.launch_prompt(sys.modules[__name__], data, lane)
+            if text.strip():
+                prompt += "\n\n" + text
         elif resume:
             if not text.strip():
                 raise LaneError("send needs --message-file")
-            if lane["kind"] != "research" and (lane.get("setup", {}).get("status") != "pass"
-                    or lane["setup"]["fingerprint"] != lane_runtime.setup_fingerprint(data, lane)):
+            if not lane_runtime.setup_current(data, lane):
                 raise LaneError("lane setup is missing or stale; run 'lanectl setup' before resuming")
             prompt = text
         else:
@@ -744,10 +753,13 @@ def start(run: Run, lane_id: str, message_file: str | None, resume: bool, dry_ru
         if lane.get("token_budget") and sum(u.get("in", 0) + u.get("out", 0) for u in lane.get("usage", {}).values()) >= lane["token_budget"]:
             raise LaneError("reported token budget is exhausted; choose a new budget before continuing")
         command = build_command(run, data, lane, prompt, resume, attempt)
+        warnings = lane.get("launch_warnings") or []
         if dry_run:
             contract = lane_cache.contract(data, lane, PLUGIN_ROOT)
             printable = ["<prompt>" if c == prompt else "<contract>" if c == contract else c for c in command]
             print(json.dumps(printable))
+            for warning in warnings:
+                print(f"warning: {warning}", file=sys.stderr)
             return
         try:
             profile = lane_cache.profile(lane["tool"], lane, command,
@@ -770,6 +782,8 @@ def start(run: Run, lane_id: str, message_file: str | None, resume: bool, dry_ru
         lane.update({"attempt": attempt, "pid": proc.pid, "state": "running", "started": now(),
                      "started_ts": time.time(), "exit_code": None, "error": None})
     print(f"lane {lane_id} {'resumed' if resume else 'launched'} (attempt {attempt}, pid {proc.pid})")
+    for warning in warnings:
+        print(f"warning: {warning}")
 
 
 def cmd_launch(args) -> None:
@@ -793,7 +807,7 @@ def cmd_launch_group(args) -> None:
         if lane.get("attempt") or lane["state"] not in ("planned", "queued"):
             raise LaneError(f"{lane_id} already started or needs a coordinator decision")
         for blocker in lane.get("blocked_by", []):
-            if get_lane(data, blocker)["state"] != "merged":
+            if data["lanes"].get(blocker, {}).get("state") != "merged":
                 raise LaneError(f"{lane_id} is blocked by {blocker}")
         text = Path(brief).read_text()
         if not text.strip():
@@ -813,25 +827,37 @@ def cmd_launch_group(args) -> None:
                                       "tools": sorted(set(lane.get("extra_tools", []))),
                                       "mcp": lane_cache.mcp_digest(lane.get("mcp_config")), "adapter": template})
         groups.setdefault(grouping, []).append(lane_id)
+    held = []
     for ids in groups.values():
         leader = ids[0]
         start(run, leader, briefs[leader], resume=False, dry_run=False)
         if args.warm_cache and len(ids) > 1:
-            deadline = time.monotonic() + min(args.warm_timeout, 60)
-            while True:
-                with run.locked() as current:
-                    lane = refresh(run, current, get_lane(current, leader))
-                    info = parse_stream(run.lane_dir(leader) / "attempt-1.jsonl", lane["tool"])
-                    if lane["state"] in ("failed", "crashed", "stopped") or info["error"]:
-                        raise LaneError(f"cache leader {leader} failed; followers not launched")
-                    responded = info["response_started"] if lane["tool"] == "claude" else info["done"]
-                if responded:
-                    break
-                if time.monotonic() >= deadline:
-                    raise LaneError(f"cache warmup timed out for {leader}; followers not launched")
-                time.sleep(0.2)
+            problem = warm_up(run, leader, args.warm_timeout)
+            if problem:
+                # Followers stay unstarted; other groups are independent and still launch.
+                held.append(f"{leader} {problem}; followers not launched: {', '.join(ids[1:])}")
+                continue
         for lane_id in ids[1:]:
             start(run, lane_id, briefs[lane_id], resume=False, dry_run=False)
+    if held:
+        raise LaneError("cache warm-up incomplete: " + " | ".join(held))
+
+
+def warm_up(run: Run, leader: str, timeout: float) -> str | None:
+    """Wait until the leader's first model call has been served, so followers can hit its cache."""
+    deadline = time.monotonic() + timeout
+    while True:
+        with run.locked() as current:
+            lane = refresh(run, current, get_lane(current, leader))
+            info = parse_stream(run.lane_dir(leader) / f"attempt-{lane.get('attempt', 1)}.jsonl", lane["tool"])
+        if lane["state"] in ("failed", "crashed", "stopped") or info["error"]:
+            return "failed"
+        # Claude reports the first response; Codex reports its first item once the first call returns.
+        if info["response_started"] if lane["tool"] == "claude" else (info["last"] or info["done"]):
+            return None
+        if time.monotonic() >= deadline:
+            return "timed out"
+        time.sleep(0.2)
 
 
 def cmd_send(args) -> None:
@@ -887,15 +913,18 @@ def cmd_supervise(args) -> None:
             signal.signal(signal.SIGTERM, forward)
             budget = lane.get("token_budget")
             previous = sum(u.get("in", 0) + u.get("out", 0) for key, u in lane.get("usage", {}).items() if key != str(attempt))
+            stream, seen = ldir / f"attempt-{attempt}.jsonl", -1
             while proc.poll() is None:
-                if budget:
-                    info = parse_stream(ldir / f"attempt-{attempt}.jsonl", lane["tool"])
+                size = stream.stat().st_size if stream.exists() else 0
+                if budget and size != seen:
+                    seen = size
+                    info = parse_stream(stream, lane["tool"])
                     if previous + info["tokens_in"] + info["tokens_out"] >= budget:
                         atomic_write(ldir / f"attempt-{attempt}.guard", "reported token threshold reached; counts can arrive late")
                         with contextlib.suppress(ProcessLookupError):
                             os.killpg(proc.pid, signal.SIGTERM)
                         break
-                time.sleep(0.25)
+                time.sleep(0.5)
             try:
                 code = proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -1181,11 +1210,10 @@ def failure_lines(output: str, tail: int) -> list[str]:
 
 
 def run_checks(data: dict, lane: dict, timeout: float, tail: int) -> tuple[bool, list[str]]:
-    if lane["kind"] not in ("review", "research"):
+    if lane["kind"] not in ("review", "research") and not lane_runtime.legacy(data):
         try:
             lane_runtime.isolated(sys.modules[__name__], data, lane)
-            if (lane.get("setup", {}).get("status") != "pass"
-                    or lane["setup"]["fingerprint"] != lane_runtime.setup_fingerprint(data, lane)):
+            if not lane_runtime.setup_current(data, lane):
                 return False, ["FAIL setup missing/stale; run 'lanectl setup' before validation"]
         except (LaneError, ValueError, OSError, KeyError, subprocess.TimeoutExpired):
             return False, ["FAIL validation needs an isolated prepared worktree"]
@@ -1196,12 +1224,7 @@ def run_checks(data: dict, lane: dict, timeout: float, tail: int) -> tuple[bool,
     ok, out = True, []
     for command in commands:
         began = time.monotonic()
-        try:
-            proc = subprocess.run(command, shell=True, cwd=cwd, text=True, capture_output=True,
-                                  timeout=timeout, stdin=subprocess.DEVNULL, env=lane_runtime.environment(data, lane))
-            code, output = proc.returncode, proc.stdout + "\n" + proc.stderr
-        except subprocess.TimeoutExpired:
-            code, output = 124, f"timed out after {timeout:.0f}s"
+        code, output = lane_runtime.run_shell(command, cwd, lane_runtime.environment(data, lane), timeout)
         secs = time.monotonic() - began
         if command == data["rules"].get("secret_scan"):
             ok &= code == 0
@@ -1371,10 +1394,18 @@ def queue_lines(data: dict) -> list[str]:
     lines, head = [], None
     for position, lane in enumerate(queued, 1):
         hold = reserve_hold(data, lane)
-        if any(get_lane(data, dep)["state"] != "merged" for dep in lane["blocked_by"]):
+        unknown = [dep for dep in lane["blocked_by"] if dep not in data["lanes"]]
+        if unknown:
+            hold = "unknown dependency " + ", ".join(unknown)
+        elif any(data["lanes"][dep]["state"] != "merged" for dep in lane["blocked_by"]):
             hold = "waits for dependencies"
         if lane.get("needs_rebase"):
             hold = "needs rebase"
+        approval = lane.get("review_approval")
+        if not hold and approval and lane_head(lane) != approval["head_sha"]:
+            hold = "needs re-review (commit changed)"
+        if not hold and lane_review.dirty(sys.modules[__name__], lane):
+            hold = "uncommitted changes"
         if not hold and data.get("integration_required") and not lane_integration.current(sys.modules[__name__], data):
             hold = "needs integration proof"
         if not hold and head is None:
@@ -1408,7 +1439,22 @@ def cmd_queue(args) -> None:
     print("\n".join(lines) if lines else "merge queue empty")
 
 
+def lane_head(lane: dict) -> str:
+    worktree = lane.get("worktree")
+    if not worktree or not Path(worktree).is_dir():
+        return ""
+    return git("rev-parse", "HEAD", cwd=worktree, check=False)
+
+
+def patch_id(worktree: str, base: str, head: str) -> str:
+    """Identity of a lane's own changes, independent of where they sit on the base."""
+    diff = subprocess.run(["git", "diff", "--no-ext-diff", base, head], cwd=worktree, capture_output=True).stdout
+    out = subprocess.run(["git", "patch-id", "--stable"], cwd=worktree, input=diff, capture_output=True).stdout
+    return out.split()[0].decode() if out.split() else ""
+
+
 def sync_lanes(run: Run, data: dict, fetch: bool, check: bool, timeout: float, tail: int) -> list[str]:
+    """Rebase idle lanes under the run lock. Checks run afterwards, without the lock (check_synced)."""
     repo = Path(data["repo"])
     base = data["base"]
     target = base
@@ -1438,6 +1484,8 @@ def sync_lanes(run: Run, data: dict, fetch: bool, check: bool, timeout: float, t
             lane.update({"base": target, "needs_rebase": False})
             line = f"{lane_id} up to date"
         else:
+            old_head = lane_head(lane)
+            before = patch_id(worktree, git("merge-base", target, old_head, cwd=worktree, check=False) or target, old_head)
             proc = subprocess.run(["git", "rebase", "--quiet", target], cwd=worktree, text=True, capture_output=True)
             if proc.returncode != 0:
                 conflicts = git("diff", "--name-only", "--diff-filter=U", cwd=worktree, check=False).split()
@@ -1447,22 +1495,71 @@ def sync_lanes(run: Run, data: dict, fetch: bool, check: bool, timeout: float, t
                 continue
             lane.update({"base": target, "needs_rebase": False})
             line = f"{lane_id} rebased cleanly onto {target}"
+            new_head = lane_head(lane)
+            approval = lane.get("review_approval")
+            if approval and before and before == patch_id(worktree, target, new_head):
+                # Same changes on a newer base: the review still applies to them.
+                approval.update({"head_sha": new_head, "carried_from": old_head})
+                line += "; review approval carried forward (same changes)"
+            elif approval:
+                lane.pop("review_approval", None)
+                line += "; review approval cleared (changes differ after rebase)"
+                if lane.get("state") == "merge-queued":
+                    lane.update({"state": "in-review", "queued_at": None})
+                    line += "; removed from queue: prepare a correction review, then queue again"
             if lane.get("pr") or lane.get("state") == "merge-queued":
                 line += "; push with --force-with-lease"
         if check:
-            ok, lines = run_checks(data, lane, timeout, tail)
-            line += "; check pass" if ok else "; check FAILED:\n" + "\n".join(lines)
-            if not ok:
-                lane["state"] = "blocked"
-                lane.pop("review_approval", None)
+            lane["_check"] = True
         out.append(line)
     return out
+
+
+def check_synced(run: Run, lines: list[str], timeout: float, tail: int) -> list[str]:
+    """Run checks for lanes marked by sync_lanes, outside the run lock. Stale setup is redone first."""
+    c = sys.modules[__name__]
+    with run.locked() as data:
+        pending = {lane["id"]: lane_head(lane) for lane in data["lanes"].values() if lane.pop("_check", False)}
+        snapshot = copy.deepcopy(data)
+    results = {}
+    for lane_id, head in pending.items():
+        lane = get_lane(snapshot, lane_id)
+        setup_lines: list[str] = []
+        if not lane_runtime.setup_current(snapshot, lane):
+            ok, setup_lines = lane_runtime.setup(c, snapshot, lane, timeout)
+            if not ok:
+                results[lane_id] = (False, ["FAIL setup after rebase: " + "; ".join(setup_lines)], lane.get("setup"))
+                continue
+        ok, check_lines = run_checks(snapshot, lane, timeout, tail)
+        results[lane_id] = (ok, check_lines, lane.get("setup"))
+    with run.locked() as data:
+        for lane_id, (ok, check_lines, setup_state) in results.items():
+            lane = get_lane(data, lane_id)
+            if lane_head(lane) != pending[lane_id]:
+                lines.append(f"{lane_id} moved during checks; run sync --check again")
+                continue
+            if setup_state:
+                lane["setup"] = setup_state
+            index = next((i for i, line in enumerate(lines) if line.startswith(lane_id + " ")), None)
+            note = "; check pass" if ok else "; check FAILED:\n" + "\n".join(check_lines)
+            if index is None:
+                lines.append(lane_id + note)
+            else:
+                lines[index] += note
+            if not ok:
+                if lane["state"] != "blocked":
+                    lane["unblock_to"] = lane["state"]
+                lane["state"] = "blocked"
+                lane.pop("review_approval", None)
+    return lines
 
 
 def cmd_sync(args) -> None:
     run = resolve_run(args.run)
     with run.locked() as data:
         lines = sync_lanes(run, data, not args.no_fetch, args.check, args.timeout, args.tail)
+    if args.check:
+        lines = check_synced(run, lines, args.timeout, args.tail)
     print("\n".join(lines) if lines else "no lanes to sync")
     if args.check and any("check FAILED" in line for line in lines):
         sys.exit(4)
@@ -1476,7 +1573,9 @@ def cmd_merged(args) -> None:
         if args.pr:
             lane["pr"] = args.pr
         lines = [] if args.no_sync else sync_lanes(run, data, True, args.check, args.timeout, args.tail)
-        queue = queue_lines(data)
+    if args.check and not args.no_sync:
+        lines = check_synced(run, lines, args.timeout, args.tail)
+    queue = queue_lines(run.read())
     run.note("merge", f"{args.id} merged" + (f" ({args.pr})" if args.pr else "") + (f" as {args.commit}" if args.commit else ""))
     print(f"lane {args.id} merged")
     if lines:
@@ -1586,8 +1685,9 @@ def build_parser() -> argparse.ArgumentParser:
     send = sub.add_parser("send", help="Resume a lane's session with a new message.")
     send.add_argument("--run", required=True)
     send.add_argument("--id", required=True)
-    source = send.add_mutually_exclusive_group(required=True)
-    source.add_argument("--message-file")
+    # Reviewer lanes can be resumed on a freshly prepared packet without a message.
+    source = send.add_mutually_exclusive_group()
+    source.add_argument("--message-file", help="required for non-review lanes")
     source.add_argument("--review-from", help="forward only a validated, current blocking change list")
     send.add_argument("--correction-override", help="user's exact authorization for another correction round")
     send.add_argument("--dry-run", action="store_true")
@@ -1719,6 +1819,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         args.func(args)
+    except subprocess.TimeoutExpired as exc:
+        print(f"error: command timed out after {exc.timeout:.0f}s: {exc.cmd if isinstance(exc.cmd, str) else ' '.join(map(str, exc.cmd))}",
+              file=sys.stderr)
+        return 1
+    except subprocess.CalledProcessError as exc:
+        print(f"error: command failed (exit {exc.returncode}): {' '.join(map(str, exc.cmd)) if isinstance(exc.cmd, list) else exc.cmd}",
+              file=sys.stderr)
+        return 1
     except (LaneError, ValueError, OSError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
