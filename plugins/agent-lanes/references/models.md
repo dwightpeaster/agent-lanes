@@ -37,3 +37,4 @@ Always pass effort explicitly. Some models and configs default to `high`.
 3. A reviewer should come from the other tool than the implementer when both are installed. It catches different mistakes. Always ask the user which reviewer to use; suggest the other tool.
 4. If the user names a tool or model for a lane, use it and log the directive.
 5. When a lane fails because the model was too weak, don't silently upgrade. Tell the user and suggest the upgrade.
+6. Prefer one model per tool across parallel lanes when the work allows. Lanes on the same model and tools start with an identical prefix (system prompt, tools, lane contract), which the provider can serve from cache.

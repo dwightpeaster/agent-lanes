@@ -13,7 +13,7 @@ Goal: <what must be true when done>
 Acceptance:
 - <observable criterion>
 Ticket: <ID>. Read it with <command or tool> for full detail.
-Context: <files or helpers to start from, prior decisions, links. No pasted code>
+Context: <prior decisions, helpers to reuse, links. Start files go in --start, not here. No pasted code>
 Constraints: <region splits in shared files, reserved resources, append-only contracts>
 Effort reason: <only when effort is high: why>
 Out of scope: <what not to do>
@@ -73,10 +73,12 @@ Then re-run: <commands>. Report.
 
 ## Rebase instruction
 
+Send this only to lanes that `lanectl merged` or `lanectl sync` reported as conflicted or dirty. Clean rebases need no lane turn.
+
 ```
-REBASE: <base> moved. Merged since your branch point:
+REBASE: <base> moved and your branch conflicts in <files>. Merged since your branch point:
 - <PR or commit>: touched <files>
-Rebase onto <base> (the coordinator has already fetched it). Keep both sides of any conflict, re-run validation, report.
+Rebase onto <base> (already fetched). Keep both sides' intent, re-run the check, report.
 ```
 
 Use the same form when the user merges work out of order (for example, PR 10 before PR 9): tell the PR 9 lane exactly which merged change it must rebase over.

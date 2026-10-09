@@ -2,17 +2,18 @@
 
 ## Watch the lanes
 
-Run `lanectl wait --run <dir>`. It returns as soon as any running lane changes state. If your environment can run it in the background and notify you, do that; otherwise run it in the foreground with `--timeout`. Never poll by reading lane output yourself.
+Run `lanectl wait --run <dir> --settle 60`: it returns after a lane changes state, plus any other changes within 60 seconds. Run it in the background if your environment notifies you; otherwise in the foreground with `--timeout`. Never poll lane output yourself.
 
-On every change, send the user a one-line update:
+Send one update per batch, one line per lane:
 
 ```
 L2 (T-14) finished: ready, validation pass, $0.42. Reviewing.
-L3 (T-15) has a question: <question>. Suggest: <answer>. OK?
-L1 (T-12) failed: <one-line reason>. Suggest: <action>. How do you want to proceed?
+L1 (T-12) failed: <one-line reason>. Suggest: <action>.
 ```
 
-Run `lanectl scope --run <dir>` whenever a lane's turn ends. On scope drift or overlap: stop any affected running lane (`lanectl stop --reason`), then tell the user which lane touched what, what you suggest (revert those files, re-split ownership, or accept and re-plan), and ask.
+Collect open questions with `lanectl questions --run <dir>`. Answer what the ticket or repo rules settle; ask the rest as one numbered list, each with a suggested answer.
+
+Run `lanectl scope --run <dir>` whenever a lane's turn ends. On drift or overlap: stop affected running lanes (`lanectl stop --reason`), tell the user which lane touched what and your suggestion (revert, re-split ownership, or re-plan), and ask.
 
 **Failures, crashes, budget stops and loops always go to the user.** Report the cause and your suggestion, and wait. Never retry silently.
 
@@ -20,12 +21,12 @@ Run `lanectl scope --run <dir>` whenever a lane's turn ends. On scope drift or o
 
 When a lane reports `ready`:
 
-1. The report has all fields, and validation lists every required command as passing.
+1. The report has all fields, and `lanectl check --run <dir> --id <lane>` passes. Use its output as the evidence; never read full logs.
 2. `lanectl scope` is clean.
 3. Diff stats match the ticket's scope (`git -C <worktree> diff --stat <base>...HEAD`). Don't read the diff body.
 4. Required smoke tests passed, if the repo requires them. Run them yourself only if the repo says the coordinator must.
 
-If the thin check fails, send the lane an exact instruction based on the evidence ("`pnpm test api` fails: <failing line>. Fix it, re-run, report."). Don't investigate the code.
+If the thin check fails, send the lane an exact instruction based on the check output ("`pnpm test api` fails: <failing line>. Fix it, re-run, report."). Don't investigate the code.
 
 ## Reviewer lane (when warranted)
 
@@ -37,6 +38,15 @@ The reviewer returns either "No changes" or a CHANGE LIST. Forward the list unch
 
 ## Push, PR and merge (coordinator only)
 
+Lanes that pass review join the merge queue, which merges one at a time and respects reserved resources (a lane holding `migration=0043` waits for the one holding `0042`):
+
+```
+lanectl queue --run <dir> --add L2
+lanectl queue --run <dir>          # ordered; "next" is the lane to merge now
+```
+
+For the lane marked `next`:
+
 - Push the lane branch from its worktree. Use `--force-with-lease` only after a rebase.
 - Open or update the PR per repo rules: draft or ready, title format, body with the lane report's Outcome, Validation and Remaining.
 - **`review` mode:** tell the user the lane is ready to merge with a short summary, and wait for a go.
@@ -45,10 +55,10 @@ The reviewer returns either "No changes" or a CHANGE LIST. Forward the list unch
 
 ## After each merge
 
-1. `lanectl lane set --state merged --pr <url>` and `lanectl note --kind merge`.
+1. `lanectl merged --run <dir> --id <lane> --pr <url> --commit <sha> --check`. It records the merge, rebases idle lanes that apply cleanly, checks them, and prints the queue. Send the rebase instruction (`references/protocol.md`) only to lanes it reports as conflicted. Push rebased lanes that have a PR with `--force-with-lease`.
 2. Update the tracker per repo rules: state, closing comment with validation evidence, what wasn't exercised, and follow-ups.
 3. Follow-up work found by lanes: create tickets only if repo rules say so. Otherwise list them for the user and ask.
-4. Tell running lanes that the base moved, using the rebase instruction in `references/protocol.md` (send after their current turn ends).
+4. When a lane that was running ends its turn, run `lanectl sync --run <dir> --check` before reviewing it.
 5. Launch queued lanes whose blockers are now merged.
 6. Clean up per repo rules with `lanectl cleanup`. If the repo has no rule, ask once and log the answer.
-7. If the repo keeps generated tracker or index files in the repository, expect conflicts in them. Regenerate them with the repo's own tool after merge rather than hand-merging.
+7. Generated tracker or index files in the repository conflict often. Regenerate them with the repo's tool after merge; never hand-merge.

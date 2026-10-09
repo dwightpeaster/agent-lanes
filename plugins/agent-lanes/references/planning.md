@@ -1,8 +1,16 @@
 # Planning Lanes
 
-## Read the work, not the code
+## Read the work, then map it
 
-For each candidate item, read the ticket with its relations (blocks, blocked-by, execution order). Skim titles and acceptance criteria. Don't open source files. A lane will do that.
+For each candidate item, read the ticket with its relations (blocks, blocked-by, execution order). Skim titles and acceptance criteria.
+
+Then map each ticket to files without reading code:
+
+```
+lanectl map --repo . --terms "refund,invoice,PaymentService" [--paths "src/**"]
+```
+
+It ranks matching files with their size and a few definition lines. Use it to set ownership, judge size (3 small files or 20 across modules) for model and effort, and pick each lane's start files. Don't open source files yourself; if the map is ambiguous, run it again with sharper terms or launch a research lane.
 
 ## Shape the lanes
 
@@ -28,9 +36,14 @@ Exact-spec lanes (`--kind spec`) are only for work whose exact edits are already
 ```
 lanectl lane add --run <dir> --id L1 --items T-12 --tool claude --model <id> --effort medium \
   --worktree auto --create-worktree --branch <branch> --owns "src/api/**,tests/api/**" \
+  --start "src/api/refunds.py,tests/api/test_refunds.py" --validate "pytest tests/api" \
   --reserves "migration=0042" [--blocked-by L0] [--queued] [--budget-usd 5]
 lanectl launch --run <dir> --id L1 --brief-file <brief.md>
 ```
+
+`--start` lists the files the lane opens first, so it doesn't explore. `--validate` narrows the lane's check to its own tests when the repo allows; the full gate still runs in CI.
+
+Claude lanes load only file, search and shell tools, with no MCP servers or skills. Add them only when a lane needs them: `--extra-tools WebFetch,WebSearch` for research, `--mcp-config <file>` for a required server. Codex lanes use the user's Codex setup unchanged.
 
 Write each brief from `references/protocol.md`. The lane contract is added automatically. Write only the task-specific part.
 
