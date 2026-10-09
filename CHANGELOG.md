@@ -1,5 +1,16 @@
 # Changelog
 
+### Additional v0.2.0 draft changes
+
+- Freeze role contracts per run and adapter overrides on first use; canonicalize Claude extra tools. Use supported dynamic-system-context exclusion and explicit system-prompt snapshots.
+- Add configuration fingerprints, deduplicated first-call Claude cache samples, and unknown values for unreported Codex cache-write counts and cost.
+- Add optional `launch-group --warm-cache`, preserving unstarted followers after timeout/failure. Add an opt-in Codex developer-instruction boundary experiment and a reproducible live CLI benchmark, requiring external-call authorization.
+- Require reviewer targets; create separate detached checkouts at exact commits. Add a dedicated JSON review contract. Claude reviewers have no Bash/Edit/Write/MCP/hooks; Codex reviewers have read-only shell sandboxing and separately disabled connectors/plugins/hooks/delegation/MCP.
+- Add `review prepare` with checks, scope, CI disposition, criteria, decisions and bounded inline diffs. Add `review findings` to verify source quotes/lines and separate blockers from follow-ups; `send --review-from` forwards only validated current blockers and enforces one correction round.
+- Re-review validated corrections with deltas. Reuse one reviewer sequentially across targets with a fresh packet. Changed gates/criteria require full review; stale approvals cannot queue a changed commit.
+- Add advisory, configurable `risk` recommendations; required reviews and sensitive changes cannot skip validated review at the merge queue.
+- Local synthetic packet measurement: 180,261 diff bytes became a 1,054-byte initial packet with patch references; a one-line fix produced a 127-byte delta. Reproduce it with `scripts/benchmark_packets.py`. This does not measure total model-token savings. New live benchmarks remain pending authorization.
+
 ## 0.2.0 — 2026-10-09
 
 ### Changed

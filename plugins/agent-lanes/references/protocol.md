@@ -42,19 +42,22 @@ If any CURRENT text is not found exactly, or a result differs: stop and report w
 
 ## Brief: reviewer lane
 
-Reviewer lanes are read-only, so give them no ownership.
+Register reviewers with `--kind review --review-of <lane>` and no ownership. Use `review prepare`
+to create a local packet with exact commits, criteria and passing gates. The helper supplies the
+review prompt; the reviewer does not fetch a PR. See `references/review.md`.
 
 ```
-Review PR <url> (branch <branch>) against ticket <ID>.
-Check, in order: correctness, security/permission/data boundaries, regressions, acceptance criteria, validation quality, reuse of existing patterns.
-Output: if everything is correct, Status: ready and "No changes".
-Otherwise Status: blocked, then a CHANGE LIST in the exact format below. Every item must be
-specific enough to apply without reading anything else. No style-only items unless the repo rules require them.
+Acceptance file: <one criterion per nonempty line, grounded in ticket ID>
+CI evidence: <successful run and exact head commit, or repo rule making CI unnecessary>
+Optional focus: <specific risky area without pasted code>
 ```
 
 ## Change list (reviewer to coordinator to implementer)
 
-Forward it to the implementing lane unchanged. Don't rewrite it and don't re-read the code.
+Reviewers return the JSON schema in `assets/review-contract.md`. Run `review findings` to validate
+anchors and separate blockers from suggestions, then `send --review-from <reviewer>` to forward
+the generated CHANGE LIST unchanged. Don't hand-edit it or re-read the code. Manual exact specs
+may still use the format below.
 
 ```
 CHANGE LIST for lane <id>

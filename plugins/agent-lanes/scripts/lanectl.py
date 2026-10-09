@@ -23,6 +23,9 @@ import sys
 import time
 from pathlib import Path
 
+import lane_cache
+import lane_review
+
 VERSION = "0.2.0"
 SCRIPT = Path(__file__).resolve()
 PLUGIN_ROOT = SCRIPT.parents[1]
@@ -48,7 +51,7 @@ MANAGED_START = "<!-- agent-lanes:start -->"
 MANAGED_END = "<!-- agent-lanes:end -->"
 PROFILE_KEYS = (
     "work_source", "base", "branch", "worktrees", "validate", "smoke", "pr", "merge", "review",
-    "tracker", "protected", "resources", "deploy", "cleanup", "mode",
+    "tracker", "protected", "resources", "deploy", "cleanup", "mode", "risk_patterns",
 )
 FAILURE_LINE = re.compile(r"error|fail|assert|exception|traceback|expected|panic|not ok|\bE\s", re.IGNORECASE)
 DEFINITION = re.compile(r"^\s*(export\s+)?(default\s+)?(async\s+)?(def|class|function|interface|type|struct|"
@@ -214,7 +217,9 @@ def get_lane(data: dict, lane_id: str) -> dict:
 
 def parse_stream(path: Path, tool: str) -> dict:
     info = {"session": None, "final": None, "cost_usd": None, "tokens_in": 0, "tokens_out": 0,
-            "fresh": 0, "cache_write": 0, "cache_read": 0, "last": None, "error": None, "done": False}
+            "fresh": 0, "cache_write": 0 if tool == "claude" else None, "cache_read": 0,
+            "first_call": None, "model_calls": {}, "response_started": False,
+            "last": None, "error": None, "done": False}
     if not path.exists():
         return info
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -227,10 +232,19 @@ def parse_stream(path: Path, tool: str) -> dict:
             if event.get("session_id"):
                 info["session"] = event["session_id"]
             if etype == "assistant":
+                info["response_started"] = True
+                sample = lane_cache.assistant_usage(event)
+                if sample and sample["message_id"]:
+                    info["model_calls"][sample["message_id"]] = sample
+                    if info["first_call"] is None:
+                        info["first_call"] = sample
+                    elif info["first_call"]["message_id"] == sample["message_id"]:
+                        info["first_call"] = sample
                 for block in event.get("message", {}).get("content", []) or []:
                     if block.get("type") == "tool_use":
                         info["last"] = block.get("name")
             elif etype == "result":
+                info["response_started"] |= not bool(event.get("is_error"))
                 info["done"] = True
                 info["final"] = event.get("result")
                 info["cost_usd"] = event.get("total_cost_usd")
@@ -271,6 +285,10 @@ def parse_stream(path: Path, tool: str) -> dict:
 def report_status(final: str | None) -> str | None:
     if not final:
         return None
+    with contextlib.suppress(ValueError, TypeError, AttributeError):
+        value = json.loads(final).get("status")
+        if value in ("ready", "blocked"):
+            return value
     match = re.search(r"^\s*Status:\s*([A-Za-z-]+)", final, re.MULTILINE)
     return match.group(1).lower() if match else None
 
@@ -300,13 +318,20 @@ def refresh(run: Run, data: dict, lane: dict) -> dict:
     usage = lane.setdefault("usage", {})
     usage[str(attempt)] = {"in": info["tokens_in"], "out": info["tokens_out"], "cost_usd": info["cost_usd"],
                            "fresh": info["fresh"], "cache_write": info["cache_write"],
-                           "cache_read": info["cache_read"], "secs": secs}
+                           "cache_read": info["cache_read"], "secs": secs,
+                           "first_call": info["first_call"], "model_calls": list(info["model_calls"].values()),
+                           "cache_profile": lane.get("cache_profile"), "resumed": attempt > 1}
     if lane.get("state") == "running":
         if exit_file.exists():
             code = int((exit_file.read_text().strip() or "1"))
             lane["exit_code"] = code
             lane["state"] = "turn-ended" if code == 0 and not info["error"] else "failed"
             lane["error"] = info["error"]
+            if lane["kind"] == "review":
+                try:
+                    lane_review.verify_checkout(sys.modules[__name__], lane)
+                except LaneError as exc:
+                    lane.update({"state": "failed", "error": str(exc), "report_status": "blocked"})
         elif not pid_alive(lane.get("pid")):
             lane["state"] = "crashed"
     return lane
@@ -333,6 +358,8 @@ def cmd_doctor(args) -> None:
 
 def cmd_run_new(args) -> None:
     root = repo_root(args.repo)
+    if args.codex_contract == "developer" and not args.codex_developer_prefix_file:
+        raise LaneError("developer experiment requires --codex-developer-prefix-file preserving existing instructions")
     profile = read_profile(root)
     args.base = args.base or profile.get("base")
     if not args.base:
@@ -348,9 +375,13 @@ def cmd_run_new(args) -> None:
     data = {
         "schema": 1, "id": run_id, "name": args.name, "repo": str(root), "base": args.base,
         "mode": args.mode, "effort_ceiling": DEFAULT_CEILING, "state": "open",
-        "created": now(), "updated": now(),
+        "created": now(), "updated": now(), "contracts": lane_cache.snapshot_contracts(PLUGIN_ROOT),
+        "profile": profile, "codex_contract": args.codex_contract,
+        "codex_developer_prefix": Path(args.codex_developer_prefix_file).read_text()
+                                  if args.codex_developer_prefix_file else "",
         "rules": {"validate": split_commands(profile.get("validate")),
-                  "protected": split_commands(profile.get("protected")), "notes": []},
+                  "protected": split_commands(profile.get("protected")), "notes": [],
+                  "risk_patterns": csv(profile.get("risk_patterns"))},
         "lanes": {},
     }
     atomic_write(path / "run.json", json.dumps(data, indent=2, sort_keys=True) + "\n")
@@ -388,6 +419,8 @@ def cmd_run_set(args) -> None:
             data["rules"]["validate"] = split_commands(args.validate)
         if args.protected is not None:
             data["rules"]["protected"] = csv(args.protected)
+        if args.risk_patterns is not None:
+            data["rules"]["risk_patterns"] = csv(args.risk_patterns)
         if args.state:
             data["state"] = args.state
     if args.mode:
@@ -400,6 +433,10 @@ def cmd_run_set(args) -> None:
 def cmd_lane_add(args) -> None:
     run = resolve_run(args.run)
     effort_rank(args.effort)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", args.id):
+        raise LaneError("lane id must be 1–64 letters, digits, underscores or hyphens")
+    if args.kind == "review" and not args.review_of:
+        raise LaneError("review lanes require --review-of <implementation lane>")
     with run.locked() as data:
         if args.id in data["lanes"]:
             raise LaneError(f"lane {args.id} already exists")
@@ -412,7 +449,7 @@ def cmd_lane_add(args) -> None:
         worktree = args.worktree
         if worktree == "auto":
             worktree = str(run.path / "worktrees" / args.id)
-        if worktree and args.create_worktree:
+        if worktree and args.create_worktree and args.kind != "review":
             branch_exists = git("rev-parse", "--verify", "--quiet", f"refs/heads/{args.branch}",
                                 cwd=repo, check=False)
             if branch_exists:
@@ -430,10 +467,12 @@ def cmd_lane_add(args) -> None:
             "attempt": 0, "session": None, "pid": None, "pr": None, "override": args.override,
             "created": now(),
         }
+        if args.kind == "review":
+            lane_review.register(sys.modules[__name__], run, data, lane, args.review_of)
         data["lanes"][args.id] = lane
         run.lane_dir(args.id).mkdir(parents=True, exist_ok=True)
     if args.override:
-        run.note("directive", f"{args.id} effort {args.effort} above ceiling. User instruction: {args.override}")
+        run.note("directive", f"{args.id} effort {args.effort}. User instruction: {args.override}")
     print(f"lane {args.id} added ({args.tool}/{args.model}@{args.effort})")
 
 
@@ -441,6 +480,11 @@ def cmd_lane_set(args) -> None:
     run = resolve_run(args.run)
     with run.locked() as data:
         lane = get_lane(data, args.id)
+        if lane.get("state") == "running" and any(getattr(args, key) is not None
+                                                  for key in ("model", "effort", "branch", "owns", "validate")):
+            raise LaneError("do not change a running lane's launch settings")
+        if lane["kind"] == "review" and (args.owns or args.branch or args.validate):
+            raise LaneError("reviewer ownership, branch and validation cannot be overridden")
         if args.state:
             if args.state not in LANE_STATES:
                 raise LaneError(f"state must be one of {', '.join(LANE_STATES)}")
@@ -473,6 +517,12 @@ def load_adapters() -> dict:
     return adapters
 
 
+def run_adapters(data: dict) -> dict:
+    if "adapters" not in data:
+        data["adapters"] = load_adapters()
+    return data["adapters"]
+
+
 def check_command(run_path: Path | str, lane_id: str) -> str:
     return f"python3 {shlex.quote(str(SCRIPT))} check --run {shlex.quote(str(run_path))} --id {lane_id}"
 
@@ -500,14 +550,39 @@ def render_assignment(data: dict, lane: dict, run_path: Path) -> str:
 
 def build_command(run: Run, data: dict, lane: dict, prompt: str, resume: bool, attempt: int) -> list[str]:
     tool = lane["tool"]
-    template = load_adapters()[tool]["resume" if resume else "new"]
+    adapters = run_adapters(data)
+    template = adapters[tool]["resume" if resume else "new"]
+    review = lane["kind"] == "review"
+    # Custom adapters cannot bypass reviewer restrictions.
+    if review:
+        if tool == "claude":
+            template = ["claude", "-p", "{prompt}", "--model", "{model}", "--effort", "{effort}",
+                        "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk",
+                        "--append-system-prompt", "{contract}", "--tools", "Read,Glob,Grep",
+                        "--strict-mcp-config", "--mcp-config", NO_MCP, "--disable-slash-commands",
+                        "--settings", '{"disableAllHooks":true}', "--disallowedTools", "Edit,Write,Bash,Agent,Read(**/.env*)",
+                        "{budget_args}"]
+            if resume:
+                template += ["--resume", "{session}"]
+        else:
+            template = ["codex", "exec", "--json", "-o", "{last}", "-m", "{model}",
+                        "-c", "model_reasoning_effort={effort}", "--sandbox", "read-only",
+                        "-c", 'approval_policy="never"', "-C", "{worktree}"]
+            try:
+                template += lane_cache.reviewer_codex_flags(lane["worktree"])
+            except ValueError as exc:
+                raise LaneError(str(exc)) from exc
+            if resume:
+                # Parent exec options retain the read-only policy on resume.
+                template += ["resume", "{session}"]
+            template += ["{prompt}"]
     if resume and not lane.get("session"):
         raise LaneError(f"lane {lane['id']} has no session to resume yet")
     gitdir = ""
     if lane.get("worktree"):
         gitdir = git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=lane["worktree"], check=False)
     allow = DEFAULT_ALLOW.get(tool, []) + lane.get("allow", [])
-    if tool == "claude":
+    if tool == "claude" and not review:
         # Lanes may run their validation and the compact check wrapper without prompting.
         for command in [check_command(run.path, lane["id"]), *lane_validation(data, lane)]:
             allow += [f"Bash({command})", f"Bash({command} *)"]
@@ -522,8 +597,8 @@ def build_command(run: Run, data: dict, lane: dict, prompt: str, resume: bool, a
         "{session}": lane.get("session") or "", "{name}": f"{data['id']}-{lane['id']}",
         "{worktree}": lane.get("worktree") or str(run.path), "{gitdir}": gitdir or str(run.path),
         "{last}": str(run.lane_dir(lane["id"]) / f"attempt-{attempt}.last.md"),
-        "{contract}": CONTRACT.read_text(encoding="utf-8").strip(),
-        "{tools}": ",".join(dict.fromkeys(LANE_TOOLS + lane.get("extra_tools", []))),
+        "{contract}": lane_cache.contract(data, lane, PLUGIN_ROOT),
+        "{tools}": ",".join(LANE_TOOLS + sorted(set(lane.get("extra_tools", [])) - set(LANE_TOOLS))),
         "{mcp_config}": lane.get("mcp_config") or NO_MCP,
     }
     command: list[str] = []
@@ -534,6 +609,14 @@ def build_command(run: Run, data: dict, lane: dict, prompt: str, resume: bool, a
         for key, value in scalars.items():
             token = token.replace(key, value)
         command.append(token)
+    if tool == "claude" and (review or template == DEFAULT_ADAPTERS["claude"]["resume" if resume else "new"]):
+        try:
+            command += lane_cache.claude_cache_flags()
+        except ValueError as exc:
+            raise LaneError(str(exc)) from exc
+    if tool == "codex" and data.get("codex_contract") == "developer":
+        combined = data.get("codex_developer_prefix", "") + "\n\n" + scalars["{contract}"]
+        command[2:2] = ["-c", "developer_instructions=" + json.dumps(combined)]
     return command
 
 
@@ -547,7 +630,9 @@ def start(run: Run, lane_id: str, message_file: str | None, resume: bool, dry_ru
             if data["lanes"].get(blocker, {}).get("state") != "merged" and not resume:
                 raise LaneError(f"lane {lane_id} is blocked by {blocker} (not merged)")
         text = Path(message_file).read_text(encoding="utf-8") if message_file else ""
-        if resume:
+        if lane["kind"] == "review":
+            prompt = lane_review.launch_prompt(sys.modules[__name__], data, lane)
+        elif resume:
             if not text.strip():
                 raise LaneError("send needs --message-file")
             prompt = text
@@ -555,16 +640,26 @@ def start(run: Run, lane_id: str, message_file: str | None, resume: bool, dry_ru
             if not text.strip():
                 raise LaneError("launch needs --brief-file")
             prompt = render_assignment(data, lane, run.path) + "\n\n" + text
-            template = load_adapters()[lane["tool"]]["new"]
-            if not any("{contract}" in token for token in template):
-                prompt = CONTRACT.read_text(encoding="utf-8").strip() + "\n\n" + prompt
+            template = run_adapters(data)[lane["tool"]]["new"]
+            if not any("{contract}" in token for token in template) and data.get("codex_contract") != "developer":
+                prompt = lane_cache.contract(data, lane, PLUGIN_ROOT) + "\n\n" + prompt
+        if lane["kind"] == "review" and lane["tool"] == "codex" and not resume and data.get("codex_contract") != "developer":
+            prompt = lane_cache.contract(data, lane, PLUGIN_ROOT) + "\n\n" + prompt
         attempt = lane.get("attempt", 0) + 1
         command = build_command(run, data, lane, prompt, resume, attempt)
         if dry_run:
-            contract = CONTRACT.read_text(encoding="utf-8").strip()
+            contract = lane_cache.contract(data, lane, PLUGIN_ROOT)
             printable = ["<prompt>" if c == prompt else "<contract>" if c == contract else c for c in command]
             print(json.dumps(printable))
             return
+        try:
+            profile = lane_cache.profile(lane["tool"], lane, command,
+                                         lane_cache.contract(data, lane, PLUGIN_ROOT), prompt)
+            if lane.get("cache_profile") and profile["mcp_sha256"] != lane["cache_profile"]["mcp_sha256"]:
+                raise LaneError("MCP configuration changed; use a fresh lane instead of changing a live session")
+            lane["cache_profile"] = profile
+        except (ValueError, OSError) as exc:
+            raise LaneError(str(exc)) from exc
         ldir = run.lane_dir(lane_id)
         ldir.mkdir(parents=True, exist_ok=True)
         atomic_write(ldir / f"attempt-{attempt}.cmd.json", json.dumps(command) + "\n")
@@ -584,8 +679,89 @@ def cmd_launch(args) -> None:
     start(resolve_run(args.run), args.id, args.brief_file, resume=False, dry_run=args.dry_run)
 
 
+def cmd_launch_group(args) -> None:
+    run = resolve_run(args.run)
+    if args.warm_timeout <= 0:
+        raise LaneError("warm timeout must be positive")
+    try:
+        briefs = json.loads(Path(args.briefs_file).read_text())
+    except (ValueError, OSError) as exc:
+        raise LaneError("briefs file must map lane IDs to local brief paths") from exc
+    if not isinstance(briefs, dict) or not briefs or not all(isinstance(v, str) for v in briefs.values()):
+        raise LaneError("briefs file must be a nonempty object of lane IDs and paths")
+    data = run.read()
+    groups = {}
+    for lane_id, brief in briefs.items():
+        lane = get_lane(data, lane_id)
+        if lane.get("attempt") or lane["state"] not in ("planned", "queued"):
+            raise LaneError(f"{lane_id} already started or needs a coordinator decision")
+        for blocker in lane.get("blocked_by", []):
+            if get_lane(data, blocker)["state"] != "merged":
+                raise LaneError(f"{lane_id} is blocked by {blocker}")
+        text = Path(brief).read_text()
+        if not text.strip():
+            raise LaneError(f"empty brief for {lane_id}")
+        if lane["kind"] == "review":
+            lane_review.launch_prompt(sys.modules[__name__], data, lane)
+        template = run_adapters(data)[lane["tool"]]["new"]
+        shared = lane_cache.contract(data, lane, PLUGIN_ROOT)
+        # Group hints are candidates, not a promise of identical hidden CLI context.
+        grouping = lane_cache.digest({"tool": lane["tool"], "model": lane["model"], "effort": lane["effort"],
+                                      "kind": lane["kind"], "contract": lane_cache.digest(shared),
+                                      "tools": sorted(set(lane.get("extra_tools", []))),
+                                      "mcp": lane_cache.mcp_digest(lane.get("mcp_config")), "adapter": template})
+        groups.setdefault(grouping, []).append(lane_id)
+    for ids in groups.values():
+        leader = ids[0]
+        start(run, leader, briefs[leader], resume=False, dry_run=False)
+        if args.warm_cache and len(ids) > 1:
+            deadline = time.monotonic() + min(args.warm_timeout, 60)
+            while True:
+                with run.locked() as current:
+                    lane = refresh(run, current, get_lane(current, leader))
+                    info = parse_stream(run.lane_dir(leader) / "attempt-1.jsonl", lane["tool"])
+                    if lane["state"] in ("failed", "crashed", "stopped") or info["error"]:
+                        raise LaneError(f"cache leader {leader} failed; followers not launched")
+                    responded = info["response_started"] if lane["tool"] == "claude" else info["done"]
+                if responded:
+                    break
+                if time.monotonic() >= deadline:
+                    raise LaneError(f"cache warmup timed out for {leader}; followers not launched")
+                time.sleep(0.2)
+        for lane_id in ids[1:]:
+            start(run, lane_id, briefs[lane_id], resume=False, dry_run=False)
+
+
 def cmd_send(args) -> None:
-    start(resolve_run(args.run), args.id, args.message_file, resume=True, dry_run=args.dry_run)
+    run = resolve_run(args.run)
+    message_file = args.message_file
+    if args.review_from:
+        with run.locked() as data:
+            reviewer = get_lane(data, args.review_from)
+            lane_review.launch_prompt(sys.modules[__name__], data, reviewer)
+            if reviewer["review_of"] != args.id:
+                raise LaneError("reviewer is assigned to a different target")
+            manifest = reviewer["review"]
+            if manifest.get("status") != "blocked" or not manifest.get("validated_report"):
+                raise LaneError("validate blocking findings before forwarding them")
+            report = json.loads(Path(manifest["validated_report"]).read_text())
+            if lane_cache.digest(report) != manifest["report_sha256"]:
+                raise LaneError("validated review report changed")
+            if not any(item["blocking"] for item in report["findings"]):
+                raise LaneError("review has missing evidence but no actionable blocking changes")
+            target = get_lane(data, args.id)
+            if target.get("correction_rounds", 0) >= 1 and not args.correction_override:
+                raise LaneError("one correction round already used; ask the user before another")
+            message_file = str(Path(manifest["packet"]).parent / "changes.md")
+            if lane_cache.digest(Path(message_file).read_text()) != manifest["changes_sha256"]:
+                raise LaneError("validated change list changed")
+        if args.correction_override and not args.dry_run:
+            run.note("directive", args.correction_override)
+    start(run, args.id, message_file, resume=True, dry_run=args.dry_run)
+    if args.review_from and not args.dry_run:
+        with run.locked() as data:
+            target = get_lane(data, args.id)
+            target["correction_rounds"] = target.get("correction_rounds", 0) + 1
 
 
 def cmd_supervise(args) -> None:
@@ -729,9 +905,7 @@ def changed_files(lane: dict) -> set[str]:
     return files
 
 
-def cmd_scope(args) -> None:
-    run = resolve_run(args.run)
-    data = run.read()
+def scope_problems(data: dict) -> list[str]:
     touched: dict[str, list[str]] = {}
     problems = []
     for lane in data["lanes"].values():
@@ -746,6 +920,11 @@ def cmd_scope(args) -> None:
                 problems.append(f"{lane['id']} outside ownership: {', '.join(outside)}")
     overlaps = sorted(f"{path}: {', '.join(ids)}" for path, ids in touched.items() if len(ids) > 1)
     problems.extend(f"overlap {item}" for item in overlaps)
+    return problems
+
+
+def cmd_scope(args) -> None:
+    problems = scope_problems(resolve_run(args.run).read())
     print("\n".join(problems) if problems else "scope ok")
     if problems:
         sys.exit(3)
@@ -964,11 +1143,21 @@ def fmt_secs(secs: float | None) -> str:
 
 def lane_usage(lane: dict) -> dict:
     total = {"attempts": len(lane.get("usage", {})), "fresh": 0, "cache_write": 0, "cache_read": 0,
-             "out": 0, "cost_usd": 0.0, "secs": 0}
+             "out": 0, "cost_usd": 0.0, "secs": 0, "first_calls": [], "cache_write_known": True,
+             "cost_known": True}
     for usage in lane.get("usage", {}).values():
         for key in ("fresh", "cache_write", "cache_read", "out", "secs"):
             total[key] += usage.get(key) or 0
         total["cost_usd"] += usage.get("cost_usd") or 0.0
+        total["cache_write_known"] &= usage.get("cache_write") is not None
+        total["cost_known"] &= usage.get("cost_usd") is not None
+        if usage.get("first_call"):
+            total["first_calls"].append({**usage["first_call"], "resumed": usage.get("resumed", False),
+                                         "cache_profile": usage.get("cache_profile")})
+    if not total["cache_write_known"]:
+        total["cache_write"] = None
+    if not total["cost_known"]:
+        total["cost_usd"] = None
     return total
 
 
@@ -979,14 +1168,22 @@ def cmd_usage(args) -> None:
             refresh(run, data, lane)
     rows = {lane_id: lane_usage(lane) for lane_id, lane in data["lanes"].items()}
     keys = ("fresh", "cache_write", "cache_read", "out", "cost_usd", "secs", "attempts")
-    totals = {key: sum(row[key] for row in rows.values()) for key in keys}
+    totals = {key: sum(row[key] or 0 for row in rows.values()) for key in keys}
+    totals["cache_write_known"] = all(row["cache_write_known"] for row in rows.values())
+    totals["cost_known"] = all(row["cost_known"] for row in rows.values())
+    if not totals["cache_write_known"]:
+        totals["cache_write"] = None
+    if not totals["cost_known"]:
+        totals["cost_usd"] = None
     if args.json:
         print(json.dumps({"lanes": rows, "total": totals}, indent=2))
         return
     print(f"{'lane':<6}{'turns':>6}{'fresh':>9}{'cache-w':>9}{'cache-r':>9}{'out':>8}{'cost':>9}{'time':>9}")
     for lane_id, row in [*rows.items(), ("total", totals)]:
-        print(f"{lane_id:<6}{row['attempts']:>6}{fmt_tokens(row['fresh']):>9}{fmt_tokens(row['cache_write']):>9}"
-              f"{fmt_tokens(row['cache_read']):>9}{fmt_tokens(row['out']):>8}{fmt_cost(row['cost_usd']):>9}"
+        writes = fmt_tokens(row["cache_write"]) if row["cache_write_known"] else "unknown"
+        print(f"{lane_id:<6}{row['attempts']:>6}{fmt_tokens(row['fresh']):>9}{writes:>9}"
+              f"{fmt_tokens(row['cache_read']):>9}{fmt_tokens(row['out']):>8}"
+              f"{(fmt_cost(row['cost_usd']) if row.get('cost_known', all(r['cost_known'] for r in rows.values())) else 'unknown'):>9}"
               f"{fmt_secs(row['secs']):>9}")
 
 
@@ -1047,6 +1244,18 @@ def cmd_queue(args) -> None:
     with run.locked() as data:
         for lane_id in csv(args.add):
             lane = get_lane(data, lane_id)
+            approval = lane.get("review_approval")
+            if approval and lane_review.clean_head(sys.modules[__name__], lane) != approval["head_sha"]:
+                raise LaneError(f"{lane_id} changed after review; prepare a correction review")
+            if approval:
+                if (approval["validation_sha256"] != lane_cache.digest(lane_validation(data, lane))
+                        or approval["protected_sha256"] != lane_cache.digest(data["rules"]["protected"])):
+                    raise LaneError(f"{lane_id} gates changed after review; prepare a new review")
+                approved_report = json.loads(Path(approval["report_file"]).read_text())
+                if lane_cache.digest(approved_report) != approval["report_sha256"]:
+                    raise LaneError(f"{lane_id} approved report changed")
+            if (lane.get("review_requested") or lane_review.risk(sys.modules[__name__], data, lane, [])["review_required"]) and not approval:
+                raise LaneError(f"{lane_id} requires a validated review before joining the merge queue")
             lane.update({"state": "merge-queued", "queued_at": now()})
         for lane_id in csv(args.remove):
             get_lane(data, lane_id).update({"state": "in-review", "queued_at": None})
@@ -1141,6 +1350,9 @@ def build_parser() -> argparse.ArgumentParser:
     new.add_argument("--name", required=True)
     new.add_argument("--base", help="default: the AGENTS.md profile's base")
     new.add_argument("--mode", choices=("review", "merge-on-green"), help="default: profile mode, else review")
+    new.add_argument("--codex-contract", choices=("prompt", "developer"), default="prompt",
+                     help="developer is an opt-in cache-boundary experiment")
+    new.add_argument("--codex-developer-prefix-file", help="preserve effective existing developer instructions for experiment")
     new.set_defaults(func=cmd_run_new)
     lst = run_sub.add_parser("list")
     lst.add_argument("--repo", default=".")
@@ -1152,6 +1364,7 @@ def build_parser() -> argparse.ArgumentParser:
     rset.add_argument("--base")
     rset.add_argument("--validate", help="validation commands, ';'-separated")
     rset.add_argument("--protected", help="comma-separated protected environments/rules")
+    rset.add_argument("--risk-patterns", help="additional comma-separated sensitive path globs")
     rset.add_argument("--state", choices=("open", "closed"))
     rset.set_defaults(func=cmd_run_set)
 
@@ -1162,6 +1375,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--id", required=True)
     add.add_argument("--items", default="")
     add.add_argument("--kind", choices=KINDS, default="implement")
+    add.add_argument("--review-of", help="required for review lanes; exact-commit snapshot of this lane")
     add.add_argument("--tool", choices=TOOLS, required=True)
     add.add_argument("--model", required=True)
     add.add_argument("--effort", required=True)
@@ -1203,10 +1417,20 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument("--dry-run", action="store_true")
     launch.set_defaults(func=cmd_launch)
 
+    group = sub.add_parser("launch-group", help="Launch ready lanes, optionally warm each candidate cache group.")
+    group.add_argument("--run", required=True)
+    group.add_argument("--briefs-file", required=True, help="JSON object mapping lane IDs to brief paths")
+    group.add_argument("--warm-cache", action="store_true")
+    group.add_argument("--warm-timeout", type=float, default=30)
+    group.set_defaults(func=cmd_launch_group)
+
     send = sub.add_parser("send", help="Resume a lane's session with a new message.")
     send.add_argument("--run", required=True)
     send.add_argument("--id", required=True)
-    send.add_argument("--message-file", required=True)
+    source = send.add_mutually_exclusive_group(required=True)
+    source.add_argument("--message-file")
+    source.add_argument("--review-from", help="forward only a validated, current blocking change list")
+    send.add_argument("--correction-override", help="user's exact authorization for another correction round")
     send.add_argument("--dry-run", action="store_true")
     send.set_defaults(func=cmd_send)
 
@@ -1323,6 +1547,7 @@ def build_parser() -> argparse.ArgumentParser:
     sup.add_argument("attempt", type=int)
     sup.add_argument("cwd")
     sup.set_defaults(func=cmd_supervise)
+    lane_review.add_parsers(sys.modules[__name__], sub)
     return parser
 
 

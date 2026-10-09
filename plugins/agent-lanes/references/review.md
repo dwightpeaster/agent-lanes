@@ -1,64 +1,42 @@
 # Monitor, Review and Merge
 
-## Watch the lanes
+## Monitor and gate
 
-Run `lanectl wait --run <dir> --settle 60`: it returns after a lane changes state, plus any other changes within 60 seconds. Run it in the background if your environment notifies you; otherwise in the foreground with `--timeout`. Never poll lane output yourself.
+Use `lanectl wait --run <dir> --settle 60` with a bounded timeout, then give one line per changed lane. Collect questions with `lanectl questions`; answer from repo rules or tickets, and ask the rest as one numbered batch. Failures, crashes, budget stops, loops and scope drift require a user decision. Stop affected running lanes; never silently retry or upgrade models.
 
-Send one update per batch, one line per lane:
+Before review, check the ready report, run `lanectl check`, require clean `lanectl scope`, compare diff stats with scope, and verify smoke tests and CI. `review prepare` reruns local checks and rejects dirty targets and scope problems. For green CI, supply its exact commit and evidence. `not-required` is only for repos whose rules allow it. Missing evidence is never green.
 
-```
-L2 (T-14) finished: ready, validation pass, $0.42. Reviewing.
-L1 (T-12) failed: <one-line reason>. Suggest: <action>.
-```
+## Decide whether review is needed
 
-Collect open questions with `lanectl questions --run <dir>`. Answer what the ticket or repo rules settle; ask the rest as one numbered list, each with a suggested answer.
+`lanectl risk --run <dir> --id <lane>` recommends effort from sensitive paths, diff size, directory count and changed tests. Add repo-specific globs with `run set --risk-patterns`. It never overrides required review. Only small documentation-only changes are skip-eligible after checks and CI pass. Other changes need coordinator judgment. Risky work requires review; select high effort. Mechanical models cannot perform judgment reviews.
 
-Run `lanectl scope --run <dir>` whenever a lane's turn ends. On drift or overlap: stop affected running lanes (`lanectl stop --reason`), tell the user which lane touched what and your suggestion (revert, re-split ownership, or re-plan), and ask.
+Ask which reviewer tool/model to use unless already authorized; suggest the other tool than the implementer. Reuse reviewers sequentially for small lanes, assessing each new target afresh.
 
-**Failures, crashes, budget stops and loops always go to the user.** Report the cause and your suggestion, and wait. Never retry silently.
-
-## Thin check (always)
-
-When a lane reports `ready`:
-
-1. The report has all fields, and `lanectl check --run <dir> --id <lane>` passes. Use its output as the evidence; never read full logs.
-2. `lanectl scope` is clean.
-3. Diff stats match the ticket's scope (`git -C <worktree> diff --stat <base>...HEAD`). Don't read the diff body.
-4. Required smoke tests passed, if the repo requires them. Run them yourself only if the repo says the coordinator must.
-
-If the thin check fails, send the lane an exact instruction based on the check output ("`pnpm test api` fails: <failing line>. Fix it, re-run, report."). Don't investigate the code.
-
-## Reviewer lane (when warranted)
-
-Add a reviewer when the repo requires review, or when the work is risky (see `references/models.md`). Before launching it, ask the user which tool and model to use, suggesting the other tool than the implementer. A "use X for all reviews this run" answer is a directive; log it and stop asking.
-
-The reviewer returns either "No changes" or a CHANGE LIST. Forward the list unchanged to the implementing lane with `lanectl send`.
-
-**One correction round.** If the work is still not right after the lane applies one change list (or one thin-check fix), stop and escalate to the user with the reviewer's findings and your suggestion.
-
-## Push, PR and merge (coordinator only)
-
-Lanes that pass review join the merge queue, which merges one at a time and respects reserved resources (a lane holding `migration=0043` waits for the one holding `0042`):
+## Prepare and launch
 
 ```
-lanectl queue --run <dir> --add L2
-lanectl queue --run <dir>          # ordered; "next" is the lane to merge now
+lanectl lane add --run <dir> --id R1 --kind review --review-of L1 --tool <tool> --model <id> --effort medium
+lanectl review prepare --run <dir> --id R1 --acceptance-file <criteria> --ci-status green --ci-sha <head> --ci-evidence <run>
+lanectl launch --run <dir> --id R1 --brief-file <brief>
 ```
 
-For the lane marked `next`:
+Criteria files contain one criterion per nonempty line. The helper generates the prompt; the brief cannot redirect a reviewer. Reviewers use separate detached worktrees at the target commit. Claude gets Read, Glob and Grep, no shell/edit tools, no MCP, and disabled hooks. Codex gets a read-only sandbox without writable git directories; connectors, plugins, hooks and delegation are disabled separately. Safety settings override custom adapters.
 
-- Push the lane branch from its worktree. Use `--force-with-lease` only after a rebase.
-- Open or update the PR per repo rules: draft or ready, title format, body with the lane report's Outcome, Validation and Remaining.
-- **`review` mode:** tell the user the lane is ready to merge with a short summary, and wait for a go.
-- **`merge-on-green` mode:** merge once required checks are green, per repo rules.
-- If a merge, push or deletion is refused, stop and give the user the exact command. Never work around it.
+Packets include exact commits, criteria, passing checks, scope, CI disposition and implementer decisions. Large diffs are referenced as per-file patches instead of pasted into the initial prompt. Decisions are evidence, not proof. Dedicated reviewer rules require criterion evidence and separate blockers from suggestions.
 
-## After each merge
+## Validate and correct
 
-1. `lanectl merged --run <dir> --id <lane> --pr <url> --commit <sha> --check`. It records the merge, rebases idle lanes that apply cleanly, checks them, and prints the queue. Send the rebase instruction (`references/protocol.md`) only to lanes it reports as conflicted. Push rebased lanes that have a PR with `--force-with-lease`.
-2. Update the tracker per repo rules: state, closing comment with validation evidence, what wasn't exercised, and follow-ups.
-3. Follow-up work found by lanes: create tickets only if repo rules say so. Otherwise list them for the user and ask.
-4. When a lane that was running ends its turn, run `lanectl sync --run <dir> --check` before reviewing it.
-5. Launch queued lanes whose blockers are now merged.
-6. Clean up per repo rules with `lanectl cleanup`. If the repo has no rule, ask once and log the answer.
-7. Generated tracker or index files in the repository conflict often. Regenerate them with the repo's tool after merge; never hand-merge.
+```
+lanectl review findings --run <dir> --id R1
+lanectl send --run <dir> --id L1 --review-from R1
+```
+
+Findings are checked against pinned source text and line numbers. This rejects stale or invented anchors, not semantic mistakes. Only validated blocking replacements are forwarded; follow-ups remain separate. Unknown criteria block readiness. One correction round is allowed; another needs the user's explicit `--correction-override` directive.
+
+After fixes, run `review prepare` again, then `send` to R1. It supplies the delta from the last validated review plus prior findings. Changed criteria or gates force a full review. Use `--target L2` to reuse R1 for another lane. Rewritten history needs a fresh reviewer. Stale approval cannot authorize a changed commit.
+
+## Merge and follow up
+
+Add green lanes to `lanectl queue`; risky or mandatory reviews need validated approval for the exact commit. Push and open/update PRs per repo rules. Only the coordinator pushes and merges. In `review` mode, wait for merge authorization; in `merge-on-green`, obey repo gates and merge rules. A refused push, merge or deletion stops the run; give the exact command.
+
+After merge, call `lanectl merged --pr <url> --commit <sha> --check`, update the tracker per repo rules, and send rebase instructions only for conflicts. Sync formerly running lanes before review. Launch unblocked lanes and clean up per saved policy. Regenerate generated files with the repo tool. Create follow-up tickets only when authorized; otherwise keep suggestions for the user.

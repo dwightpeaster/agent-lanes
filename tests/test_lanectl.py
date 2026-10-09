@@ -17,6 +17,10 @@ LANECTL = PLUGIN / "scripts" / "lanectl.py"
 FAKE_CLAUDE = textwrap.dedent("""\
     #!{python}
     import json, os, sys, time, subprocess
+    if sys.argv[1:] == ["--version"]:
+        print("fake-claude 2.1.295"); sys.exit(0)
+    if sys.argv[1:] == ["--help"]:
+        print("--exclude-dynamic-system-prompt-sections --system-prompt-snapshot"); sys.exit(0)
     log = os.environ["FAKE_LOG"]
     with open(log, "a") as f:
         f.write(json.dumps({{"tool": "claude", "argv": sys.argv[1:], "cwd": os.getcwd()}}) + "\\n")
@@ -36,6 +40,12 @@ FAKE_CLAUDE = textwrap.dedent("""\
 FAKE_CODEX = textwrap.dedent("""\
     #!{python}
     import json, os, sys
+    if sys.argv[1:] == ["--version"]:
+        print("fake-codex 0.161.0"); sys.exit(0)
+    if sys.argv[1:] == ["--help"]:
+        print("codex exec"); sys.exit(0)
+    if "mcp" in sys.argv and "list" in sys.argv:
+        print(json.dumps([{{"name": "test-server", "enabled": True}}])); sys.exit(0)
     log = os.environ["FAKE_LOG"]
     args = sys.argv[1:]
     with open(log, "a") as f:
@@ -88,7 +98,7 @@ class LaneCtlTest(unittest.TestCase):
         return proc
 
     def new_run(self) -> str:
-        return self.ctl("run", "new", "--repo", ".", "--name", "Wave one", "--base", "main").stdout.strip()
+        return self.ctl("run", "new", "--repo", ".", "--name", "Wave one", "--base", "main").stdout.splitlines()[0]
 
     def add_lane(self, run: str, lane_id: str, tool: str = "claude", **extra) -> None:
         args = ["lane", "add", "--run", run, "--id", lane_id, "--items", f"T-{lane_id}", "--tool", tool,
@@ -394,6 +404,7 @@ class SkillSurfaceTest(unittest.TestCase):
         contract = (PLUGIN / "assets/lane-contract.md").read_text()
         self.assertLessEqual(len(contract.split()), 450)
         self.assertNotIn("{", contract.replace("{lane}", ""))
+        self.assertLessEqual(len((PLUGIN / "assets/review-contract.md").read_text().split()), 450)
         self.assertLessEqual(len((PLUGIN / "assets/lane-assignment.md").read_text().split()), 80)
 
     def test_activation_cases(self) -> None:

@@ -5,7 +5,7 @@ description: Turn this agent into a thin coordinator that splits a project into 
 
 # Agent Lanes
 
-You are the **coordinator**. You keep the big picture and stay thin. Lanes read the code deeply and do the work. The user is in charge; you report to them and ask before anything they have not authorized.
+You are the **coordinator**. Keep the big picture and stay thin. Lanes read the code deeply and do the work. The user is in charge; you report to them and ask before anything they have not authorized.
 
 The helper script is `python3 <package-root>/scripts/lanectl.py`. Run `lanectl <command> --help` for flags.
 
@@ -35,3 +35,4 @@ The helper script is `python3 <package-root>/scripts/lanectl.py`. Run `lanectl <
 - Briefs, messages and report formats: `references/protocol.md`
 - Monitoring, review and merge: `references/review.md`
 - Ledger, resume and handoff: `references/handoff.md`
+- Cache profiles and experiments: `references/cache.md`
