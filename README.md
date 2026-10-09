@@ -93,6 +93,24 @@ Placeholders: `{prompt}`, `{model}`, `{effort}`, `{session}`, `{name}`, `{worktr
 - Lanes never touch the main checkout; each lane works in its own worktree.
 - A refused merge, push or deletion stops the run and hands you the exact command.
 
+## Update
+
+In Codex, refresh the marketplace and reinstall the plugin:
+
+```bash
+codex plugin marketplace upgrade agent-lanes
+codex plugin add agent-lanes@agent-lanes
+```
+
+In Claude Code:
+
+```bash
+claude plugin marketplace update agent-lanes
+claude plugin update agent-lanes@agent-lanes
+```
+
+Then run `/reload-plugins` inside Claude Code. Agent Lanes installs nothing into your repositories, so there is no per-repository upgrade step.
+
 ## Test
 
 ```bash
