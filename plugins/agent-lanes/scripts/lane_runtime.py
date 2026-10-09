@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import json
 import os
 import platform
 import re
+import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -105,6 +108,39 @@ def environment(data: dict, lane: dict) -> dict:
     return result
 
 
+def run_shell(command: str, cwd, env: dict | None, timeout: float) -> tuple[int, str]:
+    """Run a shell command in its own process group. On timeout the whole group is killed,
+    so installers and test runners started by the shell don't keep writing into the worktree."""
+    proc = subprocess.Popen(command, shell=True, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            errors="replace", start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out + "\n" + err
+    except subprocess.TimeoutExpired:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, sig)
+            try:
+                proc.communicate(timeout=5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        return 124, f"timed out after {timeout:.0f}s"
+
+
+def legacy(data: dict) -> bool:
+    """Runs created before 0.2.0 have no setup gate; their open lanes keep working unchanged."""
+    return int(data.get("schema", 1)) < 2
+
+
+def setup_current(data: dict, lane: dict) -> bool:
+    if legacy(data) or lane["kind"] in ("review", "research"):
+        return True
+    state = lane.get("setup") or {}
+    return state.get("status") == "pass" and state.get("fingerprint") == setup_fingerprint(data, lane)
+
+
 def lockfiles(root: Path) -> dict:
     locks = {}
     for folder, dirs, files in os.walk(root, followlinks=False):
@@ -120,11 +156,13 @@ def lockfiles(root: Path) -> dict:
 def setup_fingerprint(data: dict, lane: dict) -> str:
     locks = lockfiles(Path(lane["worktree"]))
     versions = {"python": sys.version.split()[0], "platform": platform.system()}
+    env = environment(data, lane) if lane.get("environment") else None
     for command in data["rules"].get("setup", []):
-        import shlex
         parts = shlex.split(command)
         if parts and Path(parts[0]).name in ("pnpm", "npm", "yarn", "uv", "node", "go", "cargo"):
-            proc = subprocess.run([parts[0], "--version"], capture_output=True, text=True, timeout=10)
+            # Version managers (corepack, volta, mise, asdf) resolve per directory, so ask from the worktree.
+            proc = subprocess.run([parts[0], "--version"], cwd=lane["worktree"], env=env, stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=10)
             if proc.returncode:
                 raise ValueError("cannot identify dependency tool version")
             versions[Path(parts[0]).name] = proc.stdout.strip()
@@ -155,12 +193,7 @@ def setup(c, data: dict, lane: dict, timeout: float = 600) -> tuple[bool, list[s
     lines = []
     began = time.monotonic()
     for index, command in enumerate(commands, 1):
-        try:
-            proc = subprocess.run(command, shell=True, cwd=root, env=env,
-                                  text=True, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
-            code = proc.returncode
-        except subprocess.TimeoutExpired:
-            code = 124
+        code, _ = run_shell(command, root, env, timeout)
         lines.append(f"setup {index}: {'PASS' if code == 0 else 'FAIL'} (exit {code})")
         if code:
             # Do not put installer output (which may contain credentials/registry URLs) in prompts or state.
@@ -183,10 +216,9 @@ def criteria_from_brief(text: str) -> list[str]:
         stripped = line.strip()
         if re.match(r"^#+\s|^[A-Za-z][\w ]+:\s*", stripped):
             break
-        if stripped.startswith(("- ", "* ")):
-            value = re.sub(r"^[-*]\s+(?:\[[ xX]\]\s*)?", "", stripped)
-            if value.strip():
-                result.append(value.strip())
+        item = re.match(r"^(?:[-*]|\d+[.)])\s+(?:\[[ xX]\]\s*)?(.*)$", stripped)
+        if item and item.group(1).strip():
+            result.append(item.group(1).strip())
     return result
 
 
@@ -210,9 +242,9 @@ def ready(c, data: dict, lane: dict, brief: str) -> None:
     criteria = lane.get("acceptance") or criteria_from_brief(brief)
     if not criteria:
         raise c.LaneError("brief needs acceptance criteria before launch")
-    if not c.lane_validation(data, lane) and not lane.get("no_validation_required"):
+    if not c.lane_gates(data, lane) and not lane.get("no_validation_required"):
         raise c.LaneError("lane needs validation or an explicit --no-validation-required directive")
-    if lane.get("setup", {}).get("status") != "pass" or lane["setup"]["fingerprint"] != setup_fingerprint(data, lane):
+    if not setup_current(data, lane):
         raise c.LaneError("lane setup is missing or stale; run 'lanectl setup' before launch")
     lane["acceptance"] = criteria
 
@@ -224,19 +256,41 @@ def add_parsers(c, sub):
     parser.set_defaults(func=lambda args: cmd_setup(c, args))
 
 
-def cmd_setup(c, args):
-    run = c.resolve_run(args.run)
+def prepare(c, run, lane_id: str, timeout: float) -> tuple[bool, list[str]]:
+    """Run a lane's setup without holding the run lock, so status, wait and stop stay responsive."""
     with run.locked() as data:
-        lane = c.get_lane(data, args.id)
+        lane = c.get_lane(data, lane_id)
         if lane["state"] == "running":
             raise c.LaneError("cannot change setup while a lane is running")
+        previous = dict(lane.get("setup") or {})
+        if previous.get("status") == "running" and c.pid_alive(previous.get("pid")):
+            raise c.LaneError("setup is already running for this lane")
         if not lane.get("environment"):
-            lane["environment"] = reserve(c, run, args.id)
-        ok, lines = setup(c, data, lane, args.timeout)
+            lane["environment"] = reserve(c, run, lane_id)
+        lane["setup"] = {**previous, "status": "running", "pid": os.getpid()}
+        snapshot = copy.deepcopy(data)
+    work = c.get_lane(snapshot, lane_id)
+    work["setup"] = previous
+    try:
+        ok, lines = setup(c, snapshot, work, timeout)
+    except BaseException:
+        with run.locked() as data:
+            c.get_lane(data, lane_id)["setup"] = {**previous, "status": "failed"}
+        raise
+    with run.locked() as data:
+        lane = c.get_lane(data, lane_id)
+        lane["setup"] = work.get("setup") or {"status": "failed"}
         if not ok:
+            if lane["state"] != "blocked":
+                lane["unblock_to"] = lane["state"]
             lane["state"] = "blocked"
-        elif lane["state"] in ("blocked", "failed") and not lane.get("attempt"):
-            lane["state"] = "planned"
+        elif lane["state"] in ("blocked", "failed"):
+            lane["state"] = lane.pop("unblock_to", None) or ("turn-ended" if lane.get("attempt") else "planned")
+    return ok, lines
+
+
+def cmd_setup(c, args):
+    ok, lines = prepare(c, c.resolve_run(args.run), args.id, args.timeout)
     print("\n".join(lines))
     if not ok:
         raise c.LaneError("setup failed; inspect the configured command and decide how to proceed")

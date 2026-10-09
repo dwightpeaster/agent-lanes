@@ -39,9 +39,28 @@ def current(c, data: dict) -> bool:
         return False
     for lane_id, head in proof["lane_heads"].items():
         lane = data["lanes"].get(lane_id)
-        if not lane or lane["state"] in ("merged", "closed") or lane_review.clean_head(c, lane) != head:
+        if not lane or lane["state"] in ("merged", "closed"):
+            return False
+        try:
+            if lane_review.clean_head(c, lane) != head:
+                return False
+        except c.LaneError:
+            # A dirty or missing worktree means the proof no longer describes it; the queue says so.
             return False
     return True
+
+
+def remove_checkout(c, data: dict, checkout: Path, keep: bool) -> None:
+    """Disposable checkouts are force-removed (generated files are expected); failed ones are kept."""
+    if keep:
+        print(f"checkout retained for inspection: {checkout} (remove with: git worktree remove --force {checkout})")
+        return
+    subprocess.run(["git", "worktree", "remove", "--force", str(checkout)], cwd=data["repo"], capture_output=True)
+
+
+# Disposable merges must not depend on the user's identity or run repository hooks.
+MERGE = ["git", "-c", "user.name=agent-lanes", "-c", "user.email=agent-lanes@localhost",
+         "merge", "--no-verify", "--no-edit", "--no-ff"]
 
 
 def cmd_integration(c, args):
@@ -71,12 +90,12 @@ def cmd_integration(c, args):
     folder = run.path / "integration" / str(time.time_ns()); folder.mkdir(parents=True)
     checkout = folder / "checkout"
     c.git("worktree", "add", "--detach", str(checkout), base, cwd=data["repo"])
-    synthetic = {"id": "integration-" + folder.name, "kind": "implement", "worktree": str(checkout),
-                 "validate": [], "environment": lane_runtime.reserve(c, run, "integration-" + folder.name)}
+    synthetic = {"id": "integration-" + folder.name, "kind": "implement", "worktree": str(checkout), "validate": []}
+    passed = False
     try:
+        synthetic["environment"] = lane_runtime.reserve(c, run, synthetic["id"])
         for lane_id in ordered:
-            proc = subprocess.run(["git", "merge", "--no-edit", "--no-ff", heads[lane_id]], cwd=checkout,
-                                  capture_output=True, text=True)
+            proc = subprocess.run([*MERGE, heads[lane_id]], cwd=checkout, capture_output=True, text=True, timeout=300)
             if proc.returncode:
                 c.git("merge", "--abort", cwd=checkout, check=False)
                 raise c.LaneError(f"integration conflict for {lane_id}; source worktrees were not changed")
@@ -105,19 +124,16 @@ def cmd_integration(c, args):
         if not ok:
             raise c.LaneError("combined validation failed; merge queue remains gated")
         print(f"integration PASS for {','.join(ordered)} at {result['head_sha']}")
+        passed = True
     finally:
-        # Never force deletion. Dirty generated files remain for inspection if Git refuses removal.
-        removed = subprocess.run(["git", "worktree", "remove", str(checkout)], cwd=data["repo"], capture_output=True)
-        if removed.returncode:
-            print(f"integration checkout retained for inspection: {checkout}")
+        remove_checkout(c, data, checkout, keep=not passed)
         lane_runtime.release(c, run, synthetic["id"])
 
 
 def baseline(c, run, data, lane, command, timeout, tail):
     head = lane_review.clean_head(c, lane); base = lane_review.base_sha(c, lane, head)
-    candidate = subprocess.run(command, shell=True, cwd=lane["worktree"], env=lane_runtime.environment(data, lane),
-                               capture_output=True, text=True, timeout=timeout)
-    if candidate.returncode:
+    code, _ = lane_runtime.run_shell(command, lane["worktree"], lane_runtime.environment(data, lane), timeout)
+    if code:
         raise c.LaneError("baseline command must first pass on the candidate commit")
     changed = lane_review.paths(c, lane["worktree"], base, head)
     tests = [path for path in changed if re_test(path)]
@@ -126,10 +142,10 @@ def baseline(c, run, data, lane, command, timeout, tail):
     folder = run.path / "baselines" / str(time.time_ns()); folder.mkdir(parents=True)
     checkout = folder / "checkout"
     c.git("worktree", "add", "--detach", str(checkout), base, cwd=data["repo"])
-    synthetic = {**lane, "id": "baseline-" + folder.name, "worktree": str(checkout), "setup": None,
-                 "environment": lane_runtime.reserve(c, run, "baseline-" + folder.name)}
-    synthetic.pop("setup")
+    synthetic = {**lane, "id": "baseline-" + folder.name, "worktree": str(checkout)}
+    synthetic.pop("setup", None)
     try:
+        synthetic["environment"] = lane_runtime.reserve(c, run, synthetic["id"])
         ok, setup_lines = lane_runtime.setup(c, data, synthetic, timeout)
         if not ok:
             raise c.LaneError("baseline dependency setup is inconclusive: " + "; ".join(setup_lines))
@@ -139,14 +155,12 @@ def baseline(c, run, data, lane, command, timeout, tail):
         if applied.returncode:
             raise c.LaneError("changed tests cannot be applied to base; baseline evidence is inconclusive")
         # Install base dependencies before the test-only overlay; setup must not modify tracked base files.
-        proc = subprocess.run(command, shell=True, cwd=checkout, env=lane_runtime.environment(data, synthetic),
-                              capture_output=True, text=True, timeout=timeout)
-        diagnostics = proc.stdout + "\n" + proc.stderr
-        inconclusive = any(word in diagnostics.lower() for word in
-                           ("modulenotfounderror", "importerror", "command not found", "no tests ran", "syntaxerror"))
-        outcome = "base-fails" if proc.returncode and not inconclusive else "inconclusive" if inconclusive else "base-passes"
+        code, diagnostics = lane_runtime.run_shell(command, checkout, lane_runtime.environment(data, synthetic), timeout)
+        inconclusive = code == 124 or any(word in diagnostics.lower() for word in
+                                          ("modulenotfounderror", "importerror", "command not found", "no tests ran", "syntaxerror"))
+        outcome = "base-fails" if code and not inconclusive else "inconclusive" if inconclusive else "base-passes"
         result = {"head_sha": head, "base_sha": base, "test_files": tests, "outcome": outcome,
-                  "exit_code": proc.returncode, "note": "base failure is evidence, not proof of complete coverage"}
+                  "exit_code": code, "note": "base failure is evidence, not proof of complete coverage"}
         c.atomic_write(folder / "result.json", json.dumps(result, indent=2) + "\n")
         print(json.dumps(result))
         return outcome == "base-fails"
@@ -160,7 +174,7 @@ def baseline(c, run, data, lane, command, timeout, tail):
                 candidate = checkout / path
                 if candidate.is_file() and not candidate.is_symlink():
                     candidate.unlink()
-        subprocess.run(["git", "worktree", "remove", str(checkout)], cwd=data["repo"], capture_output=True)
+        remove_checkout(c, data, checkout, keep=False)
         lane_runtime.release(c, run, synthetic["id"])
 
 

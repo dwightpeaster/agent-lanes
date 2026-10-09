@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import fnmatch
 import json
 import re
@@ -11,17 +12,45 @@ from pathlib import Path, PurePosixPath
 
 from lane_cache import digest
 
-RISK_PATTERNS = ["*migration*", "*auth*", "*permission*", "*payment*", "*billing*", "*transaction*",
-                 "*concurren*", "*lock*", "*security*", "*crypto*", ".github/*", "*.sh", "*config*"]
+# Sensitive areas are matched as whole words in the path, so "author" or "clock.py" don't count.
+RISK_WORDS = {"migration", "migrations", "migrate", "auth", "authn", "authz", "authentication", "authorization",
+              "permission", "permissions", "rbac", "acl", "payment", "payments", "billing", "invoice", "invoices",
+              "transaction", "transactions", "concurrency", "concurrent", "mutex", "lock", "locks", "locking",
+              "security", "secret", "secrets", "crypto", "cryptography", "encryption", "config", "configuration",
+              "settings", "deploy", "deployment", "infra", "terraform"}
+RISK_PATTERNS = [".github/*", "*.sh", "Dockerfile", "*/Dockerfile", "*.lock", "*-lock.json", "*-lock.yaml"]
 
 
-def clean_head(c, lane: dict) -> str:
+def sensitive(path: str, extra: list[str]) -> bool:
+    words = set(re.split(r"[^a-z0-9]+", path.lower()))
+    return bool(words & RISK_WORDS) or any(fnmatch.fnmatch(path.lower(), g.lower()) for g in RISK_PATTERNS + extra)
+
+
+def review_required(policy: str) -> bool:
+    """Read a free-text profile answer like "required", "No.", "not required" or "optional"."""
+    text = str(policy or "").strip().lower()
+    if not text or re.search(r"\b(no|not|none|never|optional|false|skip)\b", text):
+        return False
+    return bool(re.search(r"\b(yes|required|require|always|mandatory|must|true|human|agent)\b", text))
+
+
+def clean_head(c, lane: dict, untracked: bool = False) -> str:
+    """HEAD of a lane whose tracked files are committed. Untracked test artifacts don't change the
+    commit under review; reviewer checkouts pass untracked=True to stay strictly clean."""
     cwd = lane.get("worktree")
     if not cwd or not Path(cwd).is_dir():
         raise c.LaneError("review requires an existing target worktree")
-    if c.git("status", "--porcelain", "--untracked-files=all", cwd=cwd):
+    if c.git("status", "--porcelain", f"--untracked-files={'all' if untracked else 'no'}", cwd=cwd):
         raise c.LaneError("review requires a clean, committed worktree")
     return c.git("rev-parse", "HEAD", cwd=cwd)
+
+
+def dirty(c, lane: dict) -> bool:
+    try:
+        clean_head(c, lane)
+        return False
+    except c.LaneError:
+        return True
 
 
 def base_sha(c, lane: dict, head: str) -> str:
@@ -46,8 +75,7 @@ def risk(c, data: dict, lane: dict, extra: list[str], required: bool = False) ->
             binary = True
         else:
             size += int(added) + int(removed)
-    risky = sorted(p for p in changed if any(fnmatch.fnmatch(p.lower(), g.lower())
-                                            for g in RISK_PATTERNS + data["rules"].get("risk_patterns", []) + extra))
+    risky = sorted(p for p in changed if sensitive(p, data["rules"].get("risk_patterns", []) + extra))
     tests = any(re.search(r"(^|/)(tests?|specs?)(/|[_.])|[_.](test|spec)[_.]", p) for p in changed)
     modules = len({str(PurePosixPath(p).parent) for p in changed})
     docs_only = bool(changed) and all(Path(p).suffix.lower() in (".md", ".txt", ".rst") for p in changed)
@@ -65,7 +93,7 @@ def risk(c, data: dict, lane: dict, extra: list[str], required: bool = False) ->
     high = bool(risky or binary or size > 600 or modules > 4)
     level = "high" if high else "low" if docs_only and size <= 100 else "medium"
     policies = [data.get("profile", {}).get("review", ""), c.read_profile(Path(data["repo"])).get("review", "")]
-    repo_required = any(str(value).lower() not in ("", "no", "none", "optional") for value in policies)
+    repo_required = any(review_required(value) for value in policies)
     must_review = required or repo_required or high
     return {"head_sha": head, "base_sha": base, "level": level,
             "score": len(risky) * 3 + int(binary) * 3 + int(size > 600) * 2 + int(modules > 4) * 2
@@ -94,35 +122,45 @@ def register(c, run, data: dict, lane: dict, target_id: str) -> None:
 def verify_checkout(c, lane: dict) -> None:
     if not lane.get("review"):
         raise c.LaneError("run 'review prepare' before launching or resuming a reviewer")
-    if clean_head(c, lane) != lane["review"]["head_sha"]:
+    if clean_head(c, lane, untracked=True) != lane["review"]["head_sha"]:
         raise c.LaneError("review checkout no longer matches the prepared commit")
+
+
+def gate(c, run, data: dict, args) -> tuple[dict, dict, str]:
+    reviewer = c.get_lane(data, args.id)
+    c.refresh(run, data, reviewer)
+    if reviewer["kind"] != "review":
+        raise c.LaneError("review prepare requires a review lane")
+    if reviewer["state"] in ("running", "failed", "crashed", "stopped"):
+        raise c.LaneError("reviewer is running or needs a coordinator decision before reuse")
+    target = c.get_lane(data, args.target or reviewer["review_of"])
+    c.refresh(run, data, target)
+    if target["kind"] == "review" or target["state"] in ("running", "failed", "crashed", "stopped"):
+        raise c.LaneError("target is not ready for review")
+    return reviewer, target, clean_head(c, target)
 
 
 def prepare(c, args) -> None:
     run = c.resolve_run(args.run)
     with run.locked() as data:
-        reviewer = c.get_lane(data, args.id)
-        c.refresh(run, data, reviewer)
-        if reviewer["kind"] != "review":
-            raise c.LaneError("review prepare requires a review lane")
-        if reviewer["state"] in ("running", "failed", "crashed", "stopped"):
-            raise c.LaneError("reviewer is running or needs a coordinator decision before reuse")
-        target_id = args.target or reviewer["review_of"]
-        target = c.get_lane(data, target_id)
-        c.refresh(run, data, target)
-        if target["kind"] == "review" or target["state"] in ("running", "failed", "crashed", "stopped"):
-            raise c.LaneError("target is not ready for review")
-        head = clean_head(c, target)
+        _, target, head = gate(c, run, data, args)
         problems = c.scope_problems(data)
         if problems:
             raise c.LaneError("scope gate failed: " + "; ".join(problems))
-        if not c.lane_validation(data, target) and not args.no_checks_required:
+        if not c.lane_gates(data, target) and not args.no_checks_required:
             raise c.LaneError("no checks configured; explicit --no-checks-required is needed")
-        ok, checks = c.run_checks(data, target, args.timeout, args.tail)
-        if not ok:
-            raise c.LaneError("check gate failed: " + "\n".join(checks))
-        if clean_head(c, target) != head:
-            raise c.LaneError("target changed during checks; prepare again")
+        snapshot = copy.deepcopy(data)
+    # Checks can take many minutes; holding the lock would freeze status, wait and stop for every lane.
+    ok, checks = c.run_checks(snapshot, c.get_lane(snapshot, target["id"]), args.timeout, args.tail)
+    if not ok:
+        raise c.LaneError("check gate failed: " + "\n".join(checks))
+    with run.locked() as data:
+        reviewer, target, current = gate(c, run, data, args)
+        target_id = target["id"]
+        if current != head or c.lane_validation(data, target) != c.lane_validation(snapshot, target):
+            raise c.LaneError("target or its checks changed during checks; prepare again")
+        if c.scope_problems(data):
+            raise c.LaneError("scope changed during checks; prepare again")
         if args.ci_status == "green" and (args.ci_sha != head or not args.ci_evidence):
             raise c.LaneError("green CI requires --ci-sha matching HEAD and --ci-evidence")
         risk_result = risk(c, data, target, [])
@@ -154,9 +192,9 @@ def prepare(c, args) -> None:
             if digest(prior) != old["report_sha256"]:
                 raise c.LaneError("prior validated report changed; cannot prepare a correction delta")
         review_tree = reviewer["worktree"]
-        clean_head(c, reviewer)
+        clean_head(c, reviewer, untracked=True)
         c.git("checkout", "--detach", head, cwd=review_tree)
-        if clean_head(c, reviewer) != head:
+        if clean_head(c, reviewer, untracked=True) != head:
             raise c.LaneError("review checkout changed during preparation")
         folder = run.lane_dir(args.id) / "reviews" / f"{len(reviewer.get('review_history', [])) + 1 + bool(old)}-{time.time_ns()}"
         folder.mkdir(parents=True, exist_ok=False)
@@ -255,7 +293,9 @@ def validate(c, args) -> None:
             raise c.LaneError("reviewer is still running")
         path = Path(args.report_file) if args.report_file else run.lane_dir(args.id) / "report.md"
         try:
-            report = json.loads(path.read_text())
+            text = path.read_text().strip()
+            fenced = re.fullmatch(r"```(?:json)?\s*\n(.*)\n```", text, re.DOTALL)
+            report = json.loads(fenced.group(1) if fenced else text)
         except (OSError, ValueError) as exc:
             raise c.LaneError("reviewer report must be a JSON object") from exc
         manifest = reviewer["review"]

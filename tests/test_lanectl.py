@@ -44,8 +44,11 @@ FAKE_CODEX = textwrap.dedent("""\
         print("fake-codex 0.161.0"); sys.exit(0)
     if sys.argv[1:] == ["--help"]:
         print("codex exec"); sys.exit(0)
+    if sys.argv[1:] == ["features", "list"]:
+        print("plugins  stable  true\\napps  stable  true\\nhooks  stable  true"); sys.exit(0)
     if "mcp" in sys.argv and "list" in sys.argv:
-        print(json.dumps([{{"name": "test-server", "enabled": True}}])); sys.exit(0)
+        print(json.dumps([{{"name": "test-server", "enabled": True}}, {{"name": "odd.server", "enabled": True}},
+                          {{"name": "off-server", "enabled": False}}])); sys.exit(0)
     log = os.environ["FAKE_LOG"]
     args = sys.argv[1:]
     with open(log, "a") as f:
@@ -384,7 +387,7 @@ class LaneCtlTest(unittest.TestCase):
 
 class SkillSurfaceTest(unittest.TestCase):
     def test_manifests_versions_and_explicit_invocation(self) -> None:
-        version = "0.2.0"
+        version = "0.2.1"
         codex = json.loads((PLUGIN / ".codex-plugin/plugin.json").read_text())
         claude = json.loads((PLUGIN / ".claude-plugin/plugin.json").read_text())
         market = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text())

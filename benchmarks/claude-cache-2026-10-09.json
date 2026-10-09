@@ -1,0 +1,30 @@
+{
+  "benchmark": "Claude Code lane launch overhead and cross-lane contract caching",
+  "date": "2026-10-09",
+  "cli": "Claude Code 2.1.295",
+  "model": "claude-haiku-5-5",
+  "method": "claude -p 'Reply with just: ok' --output-format json in an empty git repository; usage fields from the result event. One sample per configuration.",
+  "fixed_overhead_per_step": [
+    {"flags": "0.1.0 defaults (all built-in tools, user MCP servers, skills)", "input": 45236, "cache_write": 20044, "cache_read": 25190},
+    {"flags": "+ --strict-mcp-config --mcp-config '{\"mcpServers\":{}}'", "input": 36483, "cache_write": 11291, "cache_read": 25190},
+    {"flags": "+ --disable-slash-commands", "input": 35968, "cache_write": 35966, "cache_read": 0},
+    {"flags": "+ --tools Read,Edit,Write,Glob,Grep,Bash (0.2.0 lane defaults)", "input": 8010, "cache_write": 968, "cache_read": 7040}
+  ],
+  "contract_placement": {
+    "note": "Two lanes started back to back with the same lane contract and different first messages.",
+    "contract_in_first_message": [
+      {"lane": "A", "input": 8898, "cache_write": 1856, "cache_read": 7040},
+      {"lane": "B", "input": 8901, "cache_write": 1859, "cache_read": 7040}
+    ],
+    "contract_in_appended_system_prompt": [
+      {"lane": "A", "input": 8907, "cache_write": 4121, "cache_read": 4784},
+      {"lane": "B", "input": 8907, "cache_write": 982, "cache_read": 7923}
+    ]
+  },
+  "limitations": [
+    "single samples, not averages",
+    "cache hits depend on provider routing and timing and are not guaranteed",
+    "lower cache writes are not a reduction in total input; more input becomes cache reads",
+    "Codex lanes started at about 17,000 input tokens and were not changed"
+  ]
+}

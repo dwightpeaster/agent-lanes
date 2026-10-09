@@ -36,7 +36,10 @@ def cmd_brief(c, args):
     if not isinstance(ticket, dict) or not isinstance(ticket.get("title"), str) or not ticket["title"].strip():
         raise c.LaneError("ticket needs a title")
     acceptance = ticket.get("acceptance") or criteria_from_brief(ticket.get("body", ""))
-    validation = ticket.get("validation") or c.lane_validation(data, lane)
+    # Explicit lane validation wins, then the ticket's; otherwise the run's gate applies unchanged.
+    explicit = lane.get("validate") or []
+    from_ticket = ticket.get("validation") or []
+    validation = explicit or from_ticket or c.lane_gates(data, lane)
     if not isinstance(acceptance, list) or not acceptance or not all(isinstance(v, str) and v.strip() for v in acceptance):
         raise c.LaneError("ticket has no explicit acceptance criteria; ask for them rather than inventing them")
     if not isinstance(validation, list) or not validation or not all(isinstance(v, str) and v.strip() for v in validation):
@@ -75,7 +78,7 @@ def cmd_brief(c, args):
         lane = c.get_lane(current, args.id)
         if lane.get("attempt"):
             raise c.LaneError("lane started while drafting; draft not adopted")
-        lane.update({"acceptance": acceptance, "validate": validation, "start": start,
+        lane.update({"acceptance": acceptance, "validate": lane.get("validate") or from_ticket, "start": start,
                      "blocked_by": sorted(set(lane["blocked_by"] + mapped)),
                      "brief_draft": {"path": str(path), "sha256": digest(text), "approved": False},
                      "ticket_source_sha256": digest(ticket)})

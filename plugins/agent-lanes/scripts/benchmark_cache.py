@@ -62,21 +62,25 @@ def main():
                 prompt = f"Mechanical CLI test, lane {index}, checkout {checkout}. Reply only OK. Do not call any tools."
                 if args.tool == "claude":
                     tools = "Read,Glob,Grep" if scenario == "claude-review-tools" else "Read,Edit,Write,Glob,Grep,Bash"
+                    review_mode = scenario == "claude-review-tools"
                     command = ["claude", "-p", prompt, "--model", args.model, "--effort", args.effort,
-                               "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk",
+                               "--output-format", "stream-json", "--verbose",
+                               "--permission-mode", "dontAsk" if review_mode else "acceptEdits",
                                "--append-system-prompt", rules, "--tools", tools, "--strict-mcp-config",
                                "--mcp-config", lanectl.NO_MCP, "--disable-slash-commands",
-                               "--settings", '{"disableAllHooks":true}', "--max-budget-usd", str(args.budget_usd)]
+                               "--settings", '{"disableAllHooks":true,"attribution":{"commit":"","pr":"","sessionUrl":false}}'
+                               if review_mode else '{"attribution":{"commit":"","pr":"","sessionUrl":false}}',
+                               "--max-budget-usd", str(args.budget_usd)]
                     if scenario != "claude-current":
                         flags = lane_cache.claude_cache_flags()
                         if "--exclude-dynamic-system-prompt-sections" not in flags:
                             raise RuntimeError("installed Claude CLI lacks the cache experiment flag")
                         command += flags
                 else:
+                    # Implementation lanes launch Codex with the user's configuration unchanged.
                     command = ["codex", "exec", "--json", "-o", str(folder / "last.md"), "-m", args.model,
-                               "-c", "model_reasoning_effort=" + args.effort, "--sandbox", "read-only",
-                               "-c", 'approval_policy="never"', "-C", str(checkout)]
-                    command += lane_cache.reviewer_codex_flags(str(checkout))
+                               "-c", "model_reasoning_effort=" + args.effort, "--sandbox", "workspace-write",
+                               "-C", str(checkout)]
                     if scenario == "codex-developer":
                         command += ["-c", "developer_instructions=" + json.dumps(prefix + "\n\n" + rules)]
                     else:
